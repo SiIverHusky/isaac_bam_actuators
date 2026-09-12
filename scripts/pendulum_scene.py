@@ -39,21 +39,67 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from isaaclab.app import AppLauncher
+# Answer --list-motors before anything Isaac-specific is imported: it is most
+# useful exactly when the environment is misconfigured, so it must not need a
+# working isaaclab to tell you the valid motor names.
+if "--list-motors" in sys.argv:
+    from bam_actuators.motors import available_motors
+
+    print("available motors:", ", ".join(available_motors()))
+    sys.exit(0)
+
+from isaaclab.app import AppLauncher  # noqa: E402
 
 # The offline harness lives with the tests; import it rather than duplicate it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 
+from bam_paths import bam_root  # noqa: E402
+
+#: BAM's source checkout. Only the *recordings* and the firmware-mirroring need it;
+#: the scene, the bundled models and the comparison all work without it.
+BAM_ROOT = bam_root()
+
 parser = argparse.ArgumentParser(description="Pendulum test scene for BamActuator.")
-parser.add_argument("--log", type=str, default=None, help="Recorded log to replay (default: BAM data_raw).")
-parser.add_argument("--steps", type=int, default=400, help="Number of log steps to replay.")
-parser.add_argument("--motor", type=str, default="sts3215", help="Motor module name.")
+parser.add_argument(
+    "--log",
+    type=str,
+    default=None,
+    help="Recorded log to replay. Default: $BAM_ROOT/data_raw/<default>.json. "
+    "Pass 'none' to drive a synthetic command sequence instead.",
+)
+parser.add_argument("--steps", type=int, default=400, help="Number of steps to simulate.")
+parser.add_argument(
+    "--motor",
+    type=str,
+    default="sts3215",
+    help="Motor name as BAM's params files write it, e.g. 'sts3215' or 'md01' - not the "
+    "module filename. The params file's 'actuator' key overrides this. See --list-motors.",
+)
 parser.add_argument("--params", type=str, default="sts3215/m5", help="Params file, or 'none'.")
+parser.add_argument("--list-motors", action="store_true", help="List valid --motor values and exit.")
+# Rig and drive, used when there is no recording.
+parser.add_argument("--mass", type=float, default=0.5, help="Tip mass [kg].")
+parser.add_argument("--arm-mass", type=float, default=0.02, help="Arm mass [kg].")
+parser.add_argument("--length", type=float, default=0.15, help="Arm length [m].")
+parser.add_argument("--dt", type=float, default=0.005, help="Timestep [s] for synthetic runs.")
+parser.add_argument(
+    "--command",
+    type=str,
+    default="steps",
+    choices=["steps", "square", "sine", "hold"],
+    help="Command sequence to drive the pendulum with when there is no recording.",
+)
 parser.add_argument("--csv", type=str, default=None, help="Write the trajectories to this CSV.")
 parser.add_argument("--visual", action="store_true", help="Show the viewport (default: headless).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = not args.visual
+
+# (--list-motors was already handled above, before the isaaclab import.)
+
+# Let "import bam" work from the source checkout, the way the tests do.
+if BAM_ROOT.is_dir():
+    sys.path.insert(0, str(BAM_ROOT))
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
@@ -81,10 +127,8 @@ ROD_RADIUS = 0.005
 
 
 def default_log() -> Path:
-    """The log the parity tests use, if BAM's checkout is where we expect."""
-    from bam_paths import bam_root
-
-    return bam_root() / "data_raw" / "2026-09-10_15h22m23.json"
+    """The recording the parity tests use, if BAM's checkout is where we expect."""
+    return BAM_ROOT / "data_raw" / "2026-09-10_15h22m23.json"
 
 
 def build_urdf(mass: float, arm_mass: float, length: float) -> str:
@@ -150,12 +194,25 @@ def build_urdf(mass: float, arm_mass: float, length: float) -> str:
 """
 
 
-def firmware_overrides(log: dict, motor: str) -> dict:
-    """Mirror BAM's ``Actuator.load_log`` so the Isaac run matches the harness.
+def firmware_overrides(log: dict | None, motor: str) -> dict:
+    """Firmware constants to configure the actuator with.
 
-    Which fields a recording supplies is motor-specific, so ask BAM when it is
-    importable rather than hard-coding the rule.
+    Firmware is **not** in params files, so it comes from the recording. Which
+    fields a recording supplies is motor-specific - ``DCMotorActuator.load_log``
+    sets ``kp`` and ``vin``, ``MD01Actuator`` also takes ``error_gain`` and
+    ``max_pwm``, ``STS3215Actuator`` overrides nothing - so ask BAM rather than
+    hard-coding the rule.
+
+    With no recording there is nothing to mirror, so return nothing and let the
+    motor module's own defaults stand. Both sides of the comparison then use those
+    same defaults, so the comparison is still fair.
+
+    :param log: The recorded log, or ``None`` for a synthetic run.
+    :param motor: Motor name, as BAM's ``actuators`` registry writes it.
     """
+    if log is None:
+        return {}
+
     try:
         from bam.actuators import actuators
 
@@ -168,9 +225,28 @@ def firmware_overrides(log: dict, motor: str) -> dict:
             "max_pwm": reference.max_pwm,
         }
     except Exception as exc:  # noqa: BLE001 - fall back, but say so
-        print(f"[scene] BAM not available ({exc}); falling back to kp/vin from the log.")
-        print("[scene] WARNING: motors that also take error_gain/max_pwm from the log will differ.")
+        print(f"[scene] BAM not usable for firmware ({exc}); using kp/vin from the log.")
+        print("[scene] WARNING: a motor that also takes error_gain/max_pwm from the log will differ.")
         return {"vin": log["vin"], "firmware_kp": log["kp"]}
+
+
+def synthetic_commands(name: str, steps: int, dt: float) -> list[float]:
+    """A goal-position sequence for runs that have no recording to replay.
+
+    :param name: One of ``"steps"``, ``"square"``, ``"sine"``, ``"hold"``.
+    :param steps: Number of samples.
+    :param dt: Timestep [s].
+    :returns: Target joint positions [rad].
+    """
+    t = np.arange(steps) * dt
+    if name == "steps":
+        # A step command is what exercises a stateful slew limiter hardest.
+        return [0.0] * (steps // 10) + [1.0] * (steps - steps // 10)
+    if name == "square":
+        return list(0.6 * np.sign(np.sin(2.0 * np.pi * 0.5 * t)))
+    if name == "sine":
+        return list(0.8 * np.sin(2.0 * np.pi * 0.5 * t))
+    return [0.0] * steps  # "hold"
 
 
 def make_scene_cfg(urdf_path: str, dt: float, actuator_cfg: BamActuatorCfg, num_envs: int = 1):
@@ -203,25 +279,47 @@ def make_scene_cfg(urdf_path: str, dt: float, actuator_cfg: BamActuatorCfg, num_
 
 
 def main() -> int:
-    log_path = Path(args.log) if args.log else default_log()
-    if not log_path.is_file():
-        print(f"[scene] log not found: {log_path}\n"
-              f"        pass --log /path/to/data_raw/<file>.json", file=sys.stderr)
-        return 1
+    # --- decide what to replay -------------------------------------
+    log_path: Path | None = None
+    if args.log and args.log.lower() != "none":
+        log_path = Path(args.log)
+        if not log_path.is_file():
+            print(f"[scene] log not found: {log_path}", file=sys.stderr)
+            return 1
+    elif args.log is None:
+        candidate = default_log()
+        if candidate.is_file():
+            log_path = candidate
+        else:
+            print(f"[scene] no recording at {candidate}")
+            print("[scene]   set BAM_ROOT to your BAM checkout, pass --log <file>, or --log none")
+            print("[scene]   falling back to a synthetic run.\n")
 
-    log = load_raw_log(str(log_path))
-    entries = log["entries"][: args.steps]
-    goals = [entry["goal_position"] for entry in entries]
-    dt = log["dt"]
-    mass, arm_mass, length = log["mass"], log["arm_mass"], log["length"]
+    if log_path is not None:
+        log = load_raw_log(str(log_path))
+        entries = log["entries"][: args.steps]
+        goals = [entry["goal_position"] for entry in entries]
+        recorded = np.array([entry["position"] for entry in entries])
+        dt = log["dt"]
+        mass, arm_mass, length = log["mass"], log["arm_mass"], log["length"]
+        q0, dq0 = float(entries[0]["position"]), float(entries[0].get("speed", 0.0))
+        provenance = log_path.name
+    else:
+        # Nothing recorded: build the rig from the CLI and drive it ourselves.
+        dt, mass, arm_mass, length = args.dt, args.mass, args.arm_mass, args.length
+        goals = synthetic_commands(args.command, args.steps, dt)
+        entries = [{"torque_enable": True} for _ in goals]
+        log, recorded, q0, dq0 = None, None, 0.0, 0.0
+        provenance = f"synthetic ({args.command})"
 
     params_file = None if args.params.lower() == "none" else resolve_params_file(args.params)
     firmware = firmware_overrides(log, args.motor)
 
-    print(f"[scene] log       : {log_path.name}  ({len(entries)} steps, dt={dt:.6f}s)")
+    print(f"[scene] source    : {provenance}  ({len(goals)} steps, dt={dt:.6f}s)")
     print(f"[scene] testbench : mass={mass} arm_mass={arm_mass} length={length}")
     print(f"[scene] motor     : {args.motor}  params={params_file}")
-    print(f"[scene] firmware  : " + " ".join(f"{k}={v:g}" for k, v in firmware.items()))
+    print("[scene] firmware  : " + (" ".join(f"{k}={v:g}" for k, v in firmware.items())
+                                     or "(motor module defaults)"))
 
     actuator_cfg = BamActuatorCfg(
         joint_names_expr=[".*"],
@@ -247,8 +345,6 @@ def main() -> int:
     actuator = robot.actuators["joint"]
     device = robot.device
 
-    # Start where the recording starts, exactly like the harness does.
-    q0, dq0 = float(entries[0]["position"]), float(entries[0].get("speed", 0.0))
     robot.write_joint_state_to_sim(
         torch.full((1, 1), q0, device=device), torch.full((1, 1), dq0, device=device)
     )
@@ -275,44 +371,43 @@ def main() -> int:
         robot.update(dt)
 
     isaac = {"positions": np.array(positions), "velocities": np.array(velocities)}
-    recorded = np.array([entry["position"] for entry in entries])
 
     # --- comparison 1: against the offline harness -------------------
+    import json
+
     from bam_actuators.friction import BamFrictionModel
     from bam_actuators.motors import get_motor
 
-    our_motor = get_motor(args.motor)()
+    # Use the motor the actuator actually resolved - the params file can override
+    # --motor - so both sides are guaranteed to run the same control law.
+    our_motor = get_motor(actuator.motor_name)()
     our_motor.set_params(
         {
-            "kp": firmware["firmware_kp"],
-            "vin": firmware["vin"],
-            "error_gain": firmware["error_gain"],
-            "max_pwm": firmware["max_pwm"],
+            "kp": actuator.motor.kp,
+            "vin": actuator.motor.vin,
+            "error_gain": actuator.motor.error_gain,
+            "max_pwm": actuator.motor.max_pwm,
         }
     )
     our_friction = BamFrictionModel.from_params({}, model=None)
     if params_file:
-        import json
-
-        data = json.loads(Path(params_file).read_text())
-        our_motor.set_params(data)
+        our_motor.set_params(json.loads(Path(params_file).read_text()))
         our_friction = BamFrictionModel.from_json(params_file)
 
-    class _Bias:
-        """Minimal testbench: BAM's bias torque, with BAM's inertia."""
+    class _Testbench:
+        """BAM's ``testbench.Pendulum``, inlined.
 
-        def __init__(self):
-            from bam.testbench import Pendulum
-
-            self._pendulum = Pendulum(log)
+        Three lines of arithmetic, so there is no reason to require the BAM
+        checkout just to run this comparison.
+        """
 
         def compute_bias(self, q, dq):
             return gravity_gain * np.sin(q)
 
         def compute_mass(self, q, dq):
-            return self._pendulum.compute_mass(q, dq)
+            return mass * length**2 + (arm_mass / 3.0) * length**2
 
-    harness = OfflineSimulator(_Bias(), our_motor, our_friction, dt, q_offset=q_offset)
+    harness = OfflineSimulator(_Testbench(), our_motor, our_friction, dt, q_offset=q_offset)
     harness.reset(q0, dq0)
     offline = drive(harness, entries, goals)
 
@@ -323,27 +418,29 @@ def main() -> int:
               f"rms={np.sqrt((delta**2).mean()):.6f} rad")
 
     print(f"\n[scene] {len(positions)} steps simulated")
-    print(f"  final position : isaac={positions[-1]:+.4f}  "
-          f"offline={offline['positions'][-1]:+.4f}  recorded={recorded[-1]:+.4f} rad")
+    finals = f"isaac={positions[-1]:+.4f}  offline={offline['positions'][-1]:+.4f}"
+    if recorded is not None:
+        finals += f"  recorded={recorded[-1]:+.4f}"
+    print(f"  final position : {finals} rad")
+
     print("  Isaac vs offline harness (same model, different integrator):")
     summarise("position", offline["positions"])
-    print("  Isaac vs the recording (model vs physical servo):")
-    summarise("position", recorded)
+    if recorded is not None:
+        print("  Isaac vs the recording (model vs physical servo):")
+        summarise("position", recorded)
 
     if args.csv:
-        np.savetxt(
-            args.csv,
-            np.column_stack([np.array(goals), isaac["positions"], isaac["velocities"],
-                             recorded, offline["positions"]]),
-            delimiter=",",
-            header="goal,isaac_pos,isaac_vel,recorded_pos,offline_pos",
-            comments="",
-        )
+        columns = [np.array(goals), isaac["positions"], isaac["velocities"], offline["positions"]]
+        header = "goal,isaac_pos,isaac_vel,offline_pos"
+        if recorded is not None:
+            columns.insert(3, recorded)
+            header = "goal,isaac_pos,isaac_vel,recorded_pos,offline_pos"
+        np.savetxt(args.csv, np.column_stack(columns), delimiter=",", header=header, comments="")
         print(f"\n[scene] wrote {args.csv}")
 
     print("\n[scene] done. A large 'vs offline' gap means the scene differs (timestep, "
-          "\ninertia or armature); a large 'vs recording' gap means the model disagrees "
-          "\nwith the servo - and that is the one worth tuning.")
+          "\ninertia or armature). If you replayed a recording, a large 'vs recording' gap "
+          "\nmeans the model disagrees with the servo - which is the one worth tuning.")
     return 0
 
 

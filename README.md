@@ -103,10 +103,11 @@ BAM_ROOT=/path/to/BAM python -m pytest tests/ -q
 # 3. Check the Isaac Lab integration without building a scene.
 python scripts/check_isaac_actuator.py
 
-# 4. Replay a recorded log through a pendulum that matches BAM's testbench.
-python scripts/pendulum_scene.py                      # headless
-python scripts/pendulum_scene.py --visual             # with a viewport
-python scripts/pendulum_scene.py --csv /tmp/traj.csv  # dump the trajectories
+# 4. Drive a pendulum whose dynamics match BAM's testbench.
+python scripts/pendulum_scene.py --visual                     # replay a recording
+python scripts/pendulum_scene.py --log none --command steps    # no recording, no BAM needed
+python scripts/pendulum_scene.py --list-motors                 # valid --motor values
+python scripts/pendulum_scene.py --csv /tmp/traj.csv
 ```
 
 **Step 2 matters more than it looks.** It verifies the friction maths, the control
@@ -133,12 +134,36 @@ I_com   = I_pivot - (mass + arm_mass) * d^2           # parallel-axis shift
 
 With gravity `-9.80665`, that reproduces BAM's `compute_mass` and `compute_bias`
 exactly, so the only remaining difference from the offline harness is the
-integrator. The scene replays a log's `goal_position` and reports both:
+integrator.
+
+**A recording is optional.** `--log none` (or a missing recording) builds the rig
+from `--mass/--arm-mass/--length/--dt` and drives `--command {steps,square,sine,hold}`,
+which needs neither BAM nor any recorded data. What the recording actually supplies
+is worth being clear about, because none of it is "measured data the motor needs to
+run":
+
+| From the log | Used for |
+| --- | --- |
+| `mass`, `arm_mass`, `length` | the **rig** - so the pendulum's inertia and gravity torque match the real testbench |
+| `goal_position` | the **command sequence** replayed as the joint target |
+| `position`/`speed` at step 0 | the **initial condition** |
+| `kp`, `vin` | **firmware constants** - params files do not contain them |
+| `position`, all steps | **comparison only** - the simulator never consumes these |
+
+So the recorded positions are the answer key, not an input. The actuator's dynamics
+come entirely from the params file (bundled, works with `--log none`) plus those
+firmware constants.
+
+When a recording *is* replayed, two comparisons are reported:
 
 - **Isaac vs the offline harness** — the same model in PhysX vs in BAM's loop.
   A gap here means the *scene* differs (timestep, inertia, armature).
 - **Isaac vs the recording** — the model against the physical servo. This is the
   one that answers "does it react like it's supposed to".
+
+`--motor` takes the name BAM's params files write (`sts3215`, `md01`), not the
+module filename; `--list-motors` prints the valid values. The params file's
+`"actuator"` key overrides it, so `--params sts3215/m5` alone is enough.
 
 The script also shows the external-torque hook in action: it computes
 `(mass + arm_mass/2) * g * L * sin(q)` each step and pushes it in via
