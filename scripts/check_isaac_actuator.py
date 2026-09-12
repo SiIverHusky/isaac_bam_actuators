@@ -56,6 +56,11 @@ def base_cfg(**overrides) -> BamActuatorCfg:
         effort_limit=5.0,
         velocity_limit=30.0,
         physics_dt=DT,
+        # All friction lives in the actuator model, so the solver must add none of
+        # its own or it would be double-counted.
+        friction=0.0,
+        dynamic_friction=0.0,
+        viscous_friction=0.0,
     )
     defaults.update(overrides)
     return BamActuatorCfg(**defaults)
@@ -79,8 +84,8 @@ def check(label: str, cfg: BamActuatorCfg) -> None:
     print(f"\n--- {label} ---")
     actuator = build(cfg)
     print(actuator)  # ActuatorBase.__str__ - proves Isaac Lab's machinery engaged
-    print(f"  motor={actuator.motor_name}  friction model={actuator.friction.model_name} "
-          f"terms={actuator.friction.active_flags}")
+    print(f"  motor={actuator.motor_name}  friction model={actuator.friction_model.model_name} "
+          f"terms={actuator.friction_model.active_flags}")
 
     assert actuator.is_implicit_model is False, "BamActuator must be explicit"
 

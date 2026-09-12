@@ -337,6 +337,11 @@ def main() -> int:
         physics_dt=dt,  # must equal the sim dt or the slew limiter is wrong
         motor=args.motor,
         params_file=params_file,
+        # All friction lives in the actuator model, so the solver must add none of
+        # its own or it would be double-counted.
+        friction=0.0,
+        dynamic_friction=0.0,
+        viscous_friction=0.0,
         **firmware,
     )
 

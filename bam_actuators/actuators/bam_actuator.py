@@ -181,7 +181,12 @@ class BamActuator(ActuatorBase):
         applied = self.motor.set_params(self._motor_overrides(data))
 
         # --- 3. friction model: ``"model"`` in the file selects m1..m6 --
-        self.friction = cfg.friction_model.build(data)
+        # NOTE: this must NOT be called ``self.friction``. ActuatorBase already
+        # defines that as the solver's joint friction coefficient, and shadowing it
+        # makes IsaacLab's ``write_joint_friction_coefficient_to_sim(actuator.friction,
+        # ...)`` fail during Articulation init with
+        # "can't assign a BamFrictionModel to a torch.cuda.FloatTensor".
+        self.friction_model = cfg.friction_model.build(data)
 
         # --- 4. armature is a motor parameter --------------------------
         # It becomes the joint's armature unless the cfg pinned one explicitly.
@@ -264,8 +269,8 @@ class BamActuator(ActuatorBase):
 
     def _report_params_file(self, params_file: str, data: dict, applied: Sequence[str]) -> None:
         """Print what the params file was used for."""
-        variant = self.friction.model_name or "custom"
-        terms = ", ".join(self.friction.active_flags) or "none"
+        variant = self.friction_model.model_name or "custom"
+        terms = ", ".join(self.friction_model.active_flags) or "none"
         print(
             f"[BamActuator] '{params_file}': motor={self.motor_name}, "
             f"model={data.get('model', 'n/a')} ({variant}), friction terms=[{terms}], "
@@ -351,7 +356,7 @@ class BamActuator(ActuatorBase):
         self.computed_effort = motor_torque + self._external_torque
 
         # --- 3. friction budget + stopping-torque clip ------------------
-        net_torque = self.friction.apply(
+        net_torque = self.friction_model.apply(
             motor_torque,
             self._external_torque,
             joint_vel,

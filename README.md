@@ -294,7 +294,14 @@ load smaller than the friction budget.
 
 - **Set the solver's joint friction to zero.** `friction`, `dynamic_friction` and
   `viscous_friction` in `ActuatorBaseCfg` are applied by PhysX *in addition* to
-  this model, so leaving them at their USD defaults double-counts friction.
+  this model, so leaving them at their USD defaults double-counts friction. The
+  scripts set all three to `0.0` explicitly.
+- **Don't shadow an `ActuatorBase` attribute.** `ActuatorBase` already defines
+  `friction`, `dynamic_friction`, `viscous_friction`, `armature`, `stiffness` and
+  `damping` as tensors. Ours is called `friction_model` for that reason: naming it
+  `friction` makes `Articulation` init fail with
+  `TypeError: can't assign a BamFrictionModel to a torch.cuda.FloatTensor`, from
+  `write_joint_friction_coefficient_to_sim(actuator.friction, ...)`.
 - **Load-dependent models need the external torque.** Isaac Lab does not hand the
   actuator the gravity/contact torque, so the external torque defaults to zero and
   the load-dependent terms (`m3`–`m6`) are inactive. Call
