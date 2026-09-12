@@ -1,0 +1,25 @@
+[package]
+
+# Semantic Versioning is used: https://semver.org/
+version = "0.1.0"
+
+# Description
+title = "BAM Actuators"
+description = "BAM extended friction actuator models (m1-m6) for Isaac Lab"
+readme = "README.md"
+repository = "https://github.com/mangdangroboticsclub/isaac_bam_actuators"
+category = "isaaclab"
+keywords = ["kit", "robotics", "actuator", "friction", "isaaclab"]
+
+[dependencies]
+"isaaclab" = {}
+# NOTE: deliberately no "isaacsim.core.api" here. Isaac Lab 3.0's migration guide
+# says to remove extensions that pull it in, as it resurrects the deprecated
+# Isaac Sim core stack.
+
+[core]
+reloadable = false
+
+# Main python module this extension provides.
+[[python.module]]
+name = "bam_actuators"
