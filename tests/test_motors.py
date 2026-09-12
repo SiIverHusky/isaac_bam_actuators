@@ -20,7 +20,9 @@ import torch
 from bam_actuators.motors import available_motors, get_motor
 from bam_actuators.params import resolve_params_file
 
-BAM_ROOT = Path("/home/hharis/Mangdang/BAM")
+from bam_paths import bam_root
+
+BAM_ROOT = bam_root()
 
 #: Motors we have a BAM counterpart for, and a bundled params file to drive them.
 PARITY_CASES = [

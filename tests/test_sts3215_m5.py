@@ -30,9 +30,11 @@ import torch
 from bam_actuators.friction import FLAG_NAMES, PARAMETER_NAMES, BamFrictionModel, variant_flags
 from bam_actuators.params import available_bundled, resolve_params_file
 
+from bam_paths import bam_root
+
 #: The model under test, loaded from the copy bundled with the extension.
 FIXTURE = Path(resolve_params_file("sts3215/m5"))
-BAM_ROOT = Path("/home/hharis/Mangdang/BAM")
+BAM_ROOT = bam_root()
 
 # Firmware settings that live on BAM's actuator *class*, not in the params file.
 BAM_STS3215_FIRMWARE = {"vin": 7.4, "kp": 32.0, "error_gain": 0.166, "max_pwm": 0.97}

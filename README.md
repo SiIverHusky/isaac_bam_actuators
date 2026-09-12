@@ -83,6 +83,51 @@ To see a freshly generated reference layout for your exact Isaac Lab version:
 python -m pip install -e /home/hharis/Mangdang/isaac_bam_actuators
 ```
 
+## Getting started on an Isaac Lab machine
+
+Prerequisites: Python 3.11 with Isaac Sim 5.x and Isaac Lab installed (Isaac Sim
+requires an NVIDIA RTX GPU — there is no CPU-only mode). Run `nvidia-smi` first.
+
+```bash
+conda activate <your-isaaclab-env>          # or: ./isaaclab.sh -p <cmd>
+
+# 1. Install this extension (editable). The bundled identified models travel with it.
+python -m pip install -e /path/to/isaac_bam_actuators
+
+# 2. Run the offline suite. No simulator, no GPU needed - and it must be green
+#    before you debug anything about the scene.
+python -m pip install pytest
+BAM_ROOT=/path/to/BAM python -m pytest tests/ -q
+# -> 71 passed. Without BAM_ROOT, 48 pass and the 23 parity tests skip.
+
+# 3. Check the Isaac Lab integration without building a scene.
+python scripts/check_isaac_actuator.py
+
+# 4. Only then wire the actuator into a task.
+```
+
+**Step 2 matters more than it looks.** It verifies the friction maths, the control
+laws and the motor+friction composition against BAM on your recorded logs, which is
+everything except Isaac Lab's plumbing and PhysX. If a trajectory then disagrees in
+Isaac, the cause is almost certainly the scene, the timestep or the effort limits —
+not the model. The parity tests need `BAM_ROOT` because `bam` cannot be
+pip-installed (its `requires-python` is `>=3.12`) and is imported from source.
+
+**Step 3** is a direct actuator instantiation: no articulation, no asset. It covers
+the `@configclass` definitions, `ActuatorBase` construction, `class_type`
+resolution, the `ArticulationActions` contract, effort clipping and a stateful
+control law over a few steps.
+
+Three things to get right when you move to step 4:
+
+- `physics_dt` must equal your task's `env.sim.dt`. The actuator never receives a
+  timestep from Isaac Lab, and a mismatch silently distorts dynamics.
+- Set `effort_limit` explicitly, or PhysX's USD joint limit does your clipping.
+- Start with `m1` or `m2`, not `m5`. Load-dependent models need
+  `set_external_torque()`; until an env calls it those terms are inert.
+  `tests/offline_rollout.py` shows exactly how to feed it.
+
+
 ## Use
 
 Explicit actuators are selected by putting their config into the `actuators`

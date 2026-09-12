@@ -239,6 +239,12 @@ class BamActuator(ActuatorBase):
         """
         overrides: dict = dict(data or {})
 
+        # Free-form overrides for identified values (kt, R, armature, q_offset,
+        # max_velocity, error_gain_ratio, ...). Needed in particular for a motor
+        # whose values are not identified yet - e.g. MD01 seeds kt at 0.0, so
+        # without this there is no way to give it a torque constant.
+        overrides.update({key: value for key, value in self.cfg.motor_params.items() if value is not None})
+
         for cfg_field, motor_name in (
             ("vin", "vin"),
             ("error_gain", "error_gain"),
@@ -397,6 +403,15 @@ class BamActuatorCfg(ActuatorBaseCfg):
     friction_model: BamFrictionCfg = field(default_factory=BamFrictionCfg)
     """Friction budget configuration. The model variant is taken from
     :attr:`params_file` when the file carries a ``"model"`` key."""
+
+    motor_params: dict = field(default_factory=dict)
+    """Overrides for identified motor values, applied on top of :attr:`params_file`.
+
+    Anything the motor module declares: ``kt``, ``R``, ``armature``, ``q_offset``,
+    ``max_velocity``, ``error_gain_ratio``, ... Useful to seed a value that is not
+    identified yet - MD01's ``kt`` defaults to ``0.0``, so it needs one to produce
+    any torque. The named firmware fields below take precedence over this.
+    """
 
     # --- firmware overrides (None -> the motor module's default) ---
     vin: float | None = None

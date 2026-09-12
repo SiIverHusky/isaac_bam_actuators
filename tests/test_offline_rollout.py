@@ -32,7 +32,9 @@ from bam_actuators.params import resolve_params_file
 
 from offline_rollout import OfflineSimulator, drive, load_raw_log
 
-BAM_ROOT = Path("/home/hharis/Mangdang/BAM")
+from bam_paths import bam_root
+
+BAM_ROOT = bam_root()
 LOG_DIR = BAM_ROOT / "data_raw"
 #: A "steps" trajectory at kp=8: step commands exercise a stateful slew limiter.
 LOG_NAME = "2026-09-10_15h22m23.json"
