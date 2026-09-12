@@ -144,6 +144,12 @@ def build_urdf(mass: float, arm_mass: float, length: float) -> str:
     The joint is continuous about +Y, so ``q = 0`` is the arm hanging down and
     positive ``q`` is counter-clockwise - BAM's convention, which makes
     ``tau_y = -(mass + arm_mass/2) * 9.80665 * L * sin(q)`` on both sides.
+
+    Everything lives on one link on purpose: a separate tip link joined by a fixed
+    joint would be merged by the importer, perturbing the inertia derived above.
+    There is no ``<collision>`` geometry either - nothing in this scene should
+    contact anything, and a shape here would be a chance for the scene to stop
+    matching BAM's contact-free single-axis model.
     """
     total_mass = mass + arm_mass
     com_distance = (mass + arm_mass / 2.0) * length / total_mass
@@ -172,24 +178,11 @@ def build_urdf(mass: float, arm_mass: float, length: float) -> str:
       <origin xyz="0 0 {-length / 2.0:.12g}" rpy="0 0 0"/>
       <geometry><cylinder radius="{ROD_RADIUS}" length="{length:.12g}"/></geometry>
     </visual>
-    <collision>
-      <origin xyz="0 0 {-length / 2.0:.12g}" rpy="0 0 0"/>
-      <geometry><cylinder radius="{ROD_RADIUS}" length="{length:.12g}"/></geometry>
-    </collision>
+    <visual>
+      <origin xyz="0 0 {-length:.12g}" rpy="0 0 0"/>
+      <geometry><sphere radius="{TIP_RADIUS}"/></geometry>
+    </visual>
   </link>
-  <link name="tip">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <mass value="0.000001"/>
-      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
-    </inertial>
-    <visual><geometry><sphere radius="{TIP_RADIUS}"/></geometry></visual>
-  </link>
-  <joint name="tip_fixed" type="fixed">
-    <parent link="arm"/>
-    <child link="tip"/>
-    <origin xyz="0 0 {-length:.12g}" rpy="0 0 0"/>
-  </joint>
 </robot>
 """
 
@@ -254,9 +247,13 @@ def make_scene_cfg(urdf_path: str, dt: float, actuator_cfg: BamActuatorCfg, num_
 
     @configclass
     class _PendulumSceneCfg(InteractiveSceneCfg):
-        """A single pendulum on a ground plane."""
+        """A single pendulum anchored to the world.
 
-        ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
+        Deliberately **no ground plane**: the joint sits at the env origin and the arm
+        hangs to ``z = -length``, so a floor at ``z = 0`` would intersect it and
+        introduce contacts that BAM's testbench does not have.
+        """
+
         light = AssetBaseCfg(
             prim_path="/World/light", spawn=sim_utils.DomeLightCfg(intensity=2000.0)
         )
@@ -266,8 +263,20 @@ def make_scene_cfg(urdf_path: str, dt: float, actuator_cfg: BamActuatorCfg, num_
                 asset_path=urdf_path,
                 fix_base=True,
                 make_instanceable=False,
-                # No drive: BamActuator is the only source of joint torque.
-                joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(target_type="none"),
+                # The importer keeps the URDF's `<inertial>` values - there is no
+                # recompute-from-geometry option - which is essential here, since they
+                # were derived to match BAM's testbench analytically. `link_density`
+                # only applies to links with no inertial block, and ours all have one.
+                #
+                # The importer requires explicit drive gains (`PDGainsCfg.stiffness`
+                # has no default), so zero them: BamActuator is the only source of
+                # joint torque, and `target_type="none"` zeroes them regardless.
+                joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+                    target_type="none",
+                    gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+                        stiffness=0.0, damping=0.0
+                    ),
+                ),
             ),
             init_state=ArticulationCfg.InitialStateCfg(
                 joint_pos={"pivot": 0.0}, joint_vel={"pivot": 0.0}
