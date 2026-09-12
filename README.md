@@ -14,6 +14,7 @@ isaac_bam_actuators/
 ├── bam_actuators/              # the Python module named in extension.toml
 │   ├── __init__.py             # lazy public API
 │   ├── friction.py             # torch port of BAM's friction budget (m1–m6)
+│   ├── trajectory.py           # port of BAM's identification motions
 │   ├── params.py               # locates the bundled identified models
 │   ├── params/                 # identified models, shipped with the extension
 │   │   └── sts3215/m1..m6.json
@@ -29,6 +30,7 @@ isaac_bam_actuators/
 └── tests/
     ├── test_friction.py        # the m1–m6 maths
     ├── test_motors.py          # each control law vs BAM's actuator class
+    ├── test_trajectory.py      # the trajectory port vs bam.trajectory
     └── test_sts3215_m5.py      # real identified models, end to end
 ```
 
@@ -98,15 +100,18 @@ python -m pip install -e /path/to/isaac_bam_actuators
 #    before you debug anything about the scene.
 python -m pip install pytest
 BAM_ROOT=/path/to/BAM python -m pytest tests/ -q
-# -> 71 passed. Without BAM_ROOT, 48 pass and the 23 parity tests skip.
+# -> 86 passed. Without BAM_ROOT, 61 pass and the 25 parity tests skip.
 
 # 3. Check the Isaac Lab integration without building a scene.
 python scripts/check_isaac_actuator.py
 
-# 4. Drive a pendulum whose dynamics match BAM's testbench.
-python scripts/pendulum_scene.py --visual                     # replay a recording
-python scripts/pendulum_scene.py --log none --command steps    # no recording, no BAM needed
-python scripts/pendulum_scene.py --list-motors                 # valid --motor values
+# 4. Drive a pendulum whose dynamics match BAM's testbench, through BAM's own
+#    identification trajectories.
+python scripts/pendulum_scene.py --visual --loop             # watch it, over and over
+python scripts/pendulum_scene.py                             # headless, paced in real time
+python scripts/pendulum_scene.py --visual --command lift_and_drop --speed 0.25
+python scripts/pendulum_scene.py --command nothing --initial-angle 1.2 --visual
+python scripts/pendulum_scene.py --list-motors                # valid --motor values
 python scripts/pendulum_scene.py --csv /tmp/traj.csv
 ```
 
@@ -136,11 +141,12 @@ With gravity `-9.80665`, that reproduces BAM's `compute_mass` and `compute_bias`
 exactly, so the only remaining difference from the offline harness is the
 integrator.
 
-**A recording is optional.** `--log none` (or a missing recording) builds the rig
-from `--mass/--arm-mass/--length/--dt` and drives `--command {steps,square,sine,hold}`,
-which needs neither BAM nor any recorded data. What the recording actually supplies
-is worth being clear about, because none of it is "measured data the motor needs to
-run":
+**A recording is optional.** Without one, the rig is built from
+`--mass/--arm-mass/--length/--dt` (the defaults are the values every recorded log
+carries) and driven by one of **BAM's own identification trajectories** via
+`--command`. That needs neither BAM nor any recorded data. What the recording
+supplies is worth being clear about, because none of it is "measured data the
+motor needs to run":
 
 | From the log | Used for |
 | --- | --- |
@@ -169,6 +175,50 @@ The script also shows the external-torque hook in action: it computes
 `(mass + arm_mass/2) * g * L * sin(q)` each step and pushes it in via
 `set_external_torque()`, which is what makes the load-dependent (`m3`–`m6`) terms
 do anything.
+
+### Driving a model through BAM's identification trajectories
+
+`bam_actuators/trajectory.py` is a port of `bam.trajectory` — same names, same
+durations, same arithmetic, pinned sample-by-sample against BAM by
+`tests/test_trajectory.py`. These are the motions the friction models were *fitted
+from*, so running one is the closest thing to re-running the identification.
+
+| `--command` | Motion | Torque |
+| --- | --- | --- |
+| `sin_time_square` | `sin(t²)` — BAM's recommended primary trajectory, sweeping the widest velocity range in a single 6 s run | on |
+| `up_and_down` | slow cubic `0 → π/2 → 0.8·π/2` | on |
+| `steps` | staircase `0 → 0.75 → 1.55 → 0.75 → 0` | on |
+| `half_sine` | slow half-sine `0 → π/2` | on |
+| `sin_sin` | multi-frequency `sin(t)·π/2 + sin(5t)·0.5·sin(2t)` | on |
+| `lift_and_drop` | cubic to `−π/2` over 2 s, **then released** | off after 2 s |
+| `nothing` | no torque — the pure gravity response | off |
+
+The two unpowered entries are the interesting ones: `torque_enable = False` is
+*not* the same as commanding zero torque. The servo contributes nothing, but
+friction and gravity still act, so the arm back-drives and falls. That is a
+distinct code path — `BamActuator.set_torque_enable()` — and it is precisely what
+those two trajectories exist to measure.
+
+`nothing` starts at 0 rad, which is the arm hanging straight down and also the
+gravity equilibrium, so it genuinely does not move. Pass `--initial-angle 1.2` to
+start it off-equilibrium if you want to watch it fall under gravity alone.
+
+### Watching it move
+
+A 6 s trajectory simulates in well under a second, so an unpaced run is over
+before the viewport draws its first frame — the window then shows a pendulum that
+never moves. Two things fix that, both on by default when `--visual` is passed:
+
+- **Pacing.** The loop sleeps to hold `--speed` (default `1.0`, real time). `0.25`
+is quarter speed, `0` runs as fast as possible.
+- **Framing.** `sim.set_camera_view()` is pointed at the arm, which is only 15 cm
+long and otherwise a speck near the world origin.
+
+Rendering is decimated to about 60 wall-clock frames per second
+(`SimulationCfg.render_interval`, scaling with `--speed` so slow motion stays
+smooth) while the actuator still sees the true `dt`. `--loop` replays the sequence
+so the motion stays on screen for as long as you want; without it the window is
+left open on the final pose.
 
 Three things to get right when wiring the actuator into a task of your own:
 
@@ -333,6 +383,7 @@ python -m pytest tests/
 | --- | --- |
 | `test_friction.py` | the m1–m6 budget maths |
 | `test_motors.py` | each control law vs BAM's actuator class |
+| `test_trajectory.py` | the trajectory port vs `bam.trajectory`, sample-by-sample, plus the `torque_enable` boundaries |
 | `test_sts3215_m5.py` | the six bundled models, end to end |
 | `test_offline_rollout.py` | **full composition**: BAM's pendulum loop driven by our motor + friction, step-by-step against `bam.simulate.Simulator` on a recorded log |
 

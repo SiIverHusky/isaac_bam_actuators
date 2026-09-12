@@ -209,6 +209,15 @@ class BamActuator(ActuatorBase):
         # never hands it to us, so it stays zero unless the env sets it.
         self._external_torque = torch.zeros(self._num_envs, self.num_joints, device=self._device)
 
+        # Whether the servo is powered, mirroring BAM's per-step ``torque_enable``.
+        # An unpowered servo produces no motor torque but still back-drives, so
+        # gravity and friction act unopposed (BAM's ``LiftAndDrop`` / ``Nothing``).
+        # Note this must not be called ``torque_enable``: keep it private so it can
+        # never collide with an :class:`ActuatorBase` attribute.
+        self._torque_enable = torch.ones(
+            self._num_envs, self.num_joints, dtype=torch.bool, device=self._device
+        )
+
         # Reflected inertia used by the stopping-torque term.
         self._inertia: torch.Tensor | None = self.armature if cfg.use_joint_armature_as_inertia else None
 
@@ -297,16 +306,40 @@ class BamActuator(ActuatorBase):
         else:
             self._external_torque[env_ids] = external_torque
 
+    def set_torque_enable(
+        self, enabled: bool | torch.Tensor, env_ids: Sequence[int] | slice | None = None
+    ) -> None:
+        """Power the servo on or off, per environment.
+
+        Mirrors the ``torque_enable`` argument of BAM's ``Simulator.step``. While
+        disabled the motor contributes no torque, but the friction budget and the
+        external torque still apply - the joint back-drives and settles under
+        gravity alone. That is what BAM's ``lift_and_drop`` and ``nothing``
+        trajectories measure, so it is not the same as commanding zero torque.
+
+        :param enabled: Whether the servo is powered. Scalars broadcast; a tensor
+            must be broadcastable to ``(num_envs, num_joints)``.
+        :param env_ids: Environments to update. Defaults to all of them.
+        """
+        if env_ids is None or env_ids == slice(None):
+            self._torque_enable[:] = enabled
+        else:
+            self._torque_enable[env_ids] = enabled
+
     # ------------------------------------------------------------------
     # ActuatorBase interface
     # ------------------------------------------------------------------
 
     def reset(self, env_ids: Sequence[int] | slice | None = None):
         """Reset the actuator internals for the given environments."""
+        # An unpowered state is a per-run experiment, never a resting state, so
+        # every env comes back powered.
         if env_ids is None or env_ids == slice(None):
             self._external_torque.zero_()
+            self._torque_enable.fill_(True)
         else:
             self._external_torque[env_ids] = 0.0
+            self._torque_enable[env_ids] = True
 
         # The motor uses BAM's `...` sentinel for "all environments".
         self.motor.reset(... if env_ids is None else env_ids)
@@ -350,7 +383,8 @@ class BamActuator(ActuatorBase):
         control = self.motor.control(q_target, joint_pos, joint_vel, cfg.physics_dt)
 
         # --- 2. motor torque (shared DC motor equation) -----------------
-        motor_torque = self.motor.torque(control, True, q_physics, joint_vel)
+        # An unpowered servo produces no torque but still back-drives.
+        motor_torque = self.motor.torque(control, self._torque_enable, q_physics, joint_vel)
 
         # Stored for logging / reward shaping (torque the motor would produce).
         self.computed_effort = motor_torque + self._external_torque

@@ -15,19 +15,31 @@ reproduces ``tau_gravity`` exactly, and a diagonal inertia chosen so the swing
 inertia about the pivot equals ``I_pivot`` exactly. The visual geometry is
 cosmetic and does not affect the dynamics.
 
-It then replays a recorded log's ``goal_position`` sequence through the actuator
-and reports two comparisons:
+It then drives the actuator with a command sequence and reports two comparisons:
 
 * **vs the offline harness** - our model simulated twice, in Isaac (PhysX) and in
   BAM's own loop. Differences here are integrator/solver, not model.
 * **vs the recording** - the model against the physical servo. This is the one that
   answers "does it react like it's supposed to".
 
+With a recording (``--log``) the command sequence is the log's own
+``goal_position``. Without one the pendulum is driven by one of **BAM's own
+identification trajectories** (``--command``), the same motions the params file was
+fitted from - including their ``torque_enable`` flag, so ``nothing`` and
+``lift_and_drop`` let the arm fall unpowered under gravity alone.
+
+**Watching it.** A 6 s trajectory simulates in a fraction of a second, so without
+pacing the whole run is over before the viewport draws a first frame. ``--speed``
+plays it back in real time (or slower), and the camera is framed on the arm, which
+is only 15 cm long.
+
 Usage::
 
-    python scripts/pendulum_scene.py                          # headless, sensible defaults
-    python scripts/pendulum_scene.py --visual                 # with a viewport
-    python scripts/pendulum_scene.py --motor md01 --params none --steps 300
+    python scripts/pendulum_scene.py                              # headless, real-time paced
+    python scripts/pendulum_scene.py --visual --loop              # watch it, over and over
+    python scripts/pendulum_scene.py --visual --command lift_and_drop --speed 0.25
+    python scripts/pendulum_scene.py --command nothing --params none
+    python scripts/pendulum_scene.py --command nothing --initial-angle 1.2 --visual
     python scripts/pendulum_scene.py --csv /tmp/traj.csv
 """
 
@@ -36,8 +48,14 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
+
+# BAM's identification trajectories drive the synthetic runs and provide the
+# --command choices. Pure numpy, so this is safe before Isaac Sim is up - which
+# matters because argparse has to see the choices first.
+from bam_actuators.trajectory import TRAJECTORIES, get_trajectory, sample
 
 # Answer --list-motors before anything Isaac-specific is imported: it is most
 # useful exactly when the environment is misconfigured, so it must not need a
@@ -67,14 +85,14 @@ parser.add_argument(
     help="Recorded log to replay. Default: $BAM_ROOT/data_raw/<default>.json. "
     "Pass 'none' to drive a synthetic command sequence instead.",
 )
-parser.add_argument("--steps", type=int, default=400, help="Number of steps to simulate.")
 parser.add_argument(
-    "--motor",
-    type=str,
-    default="sts3215",
-    help="Motor name as BAM's params files write it, e.g. 'sts3215' or 'md01' - not the "
-    "module filename. The params file's 'actuator' key overrides this. See --list-motors.",
+    "--steps",
+    type=int,
+    default=None,
+    help="Number of steps to simulate. Default: the whole trajectory, or the whole recording.",
 )
+parser.add_argument("--motor", type=str, default="sts3215", help="Motor name as BAM's params files write it, e.g. 'sts3215' or 'md01' - not the "
+    "module filename. The params file's 'actuator' key overrides this. See --list-motors.")
 parser.add_argument("--params", type=str, default="sts3215/m5", help="Params file, or 'none'.")
 parser.add_argument("--list-motors", action="store_true", help="List valid --motor values and exit.")
 # Rig and drive, used when there is no recording.
@@ -83,11 +101,31 @@ parser.add_argument("--arm-mass", type=float, default=0.02, help="Arm mass [kg].
 parser.add_argument("--length", type=float, default=0.15, help="Arm length [m].")
 parser.add_argument("--dt", type=float, default=0.005, help="Timestep [s] for synthetic runs.")
 parser.add_argument(
+    "--initial-angle",
+    type=float,
+    default=0.0,
+    help="Starting angle [rad] for synthetic runs; 0 is the arm hanging down, which is "
+    "also the gravity equilibrium. Only recordings override it (they carry their own).",
+)
+parser.add_argument(
     "--command",
     type=str,
     default="steps",
-    choices=["steps", "square", "sine", "hold"],
-    help="Command sequence to drive the pendulum with when there is no recording.",
+    choices=sorted(TRAJECTORIES),
+    help="BAM identification trajectory to drive the pendulum with when there is no "
+    "recording. All of them run for 6 s; see bam_actuators.trajectory.",
+)
+parser.add_argument(
+    "--speed",
+    type=float,
+    default=1.0,
+    help="Playback speed: 1.0 is real time, 0.25 is quarter speed, 0 runs as fast as "
+    "possible. Only affects --visual.",
+)
+parser.add_argument(
+    "--loop",
+    action="store_true",
+    help="After reporting, keep replaying the sequence so the motion stays on screen.",
 )
 parser.add_argument("--csv", type=str, default=None, help="Write the trajectories to this CSV.")
 parser.add_argument("--visual", action="store_true", help="Show the viewport (default: headless).")
@@ -223,25 +261,6 @@ def firmware_overrides(log: dict | None, motor: str) -> dict:
         return {"vin": log["vin"], "firmware_kp": log["kp"]}
 
 
-def synthetic_commands(name: str, steps: int, dt: float) -> list[float]:
-    """A goal-position sequence for runs that have no recording to replay.
-
-    :param name: One of ``"steps"``, ``"square"``, ``"sine"``, ``"hold"``.
-    :param steps: Number of samples.
-    :param dt: Timestep [s].
-    :returns: Target joint positions [rad].
-    """
-    t = np.arange(steps) * dt
-    if name == "steps":
-        # A step command is what exercises a stateful slew limiter hardest.
-        return [0.0] * (steps // 10) + [1.0] * (steps - steps // 10)
-    if name == "square":
-        return list(0.6 * np.sign(np.sin(2.0 * np.pi * 0.5 * t)))
-    if name == "sine":
-        return list(0.8 * np.sin(2.0 * np.pi * 0.5 * t))
-    return [0.0] * steps  # "hold"
-
-
 def make_scene_cfg(urdf_path: str, dt: float, actuator_cfg: BamActuatorCfg, num_envs: int = 1):
     """Scene with the pendulum, a ground plane and a light."""
 
@@ -306,29 +325,48 @@ def main() -> int:
 
     if log_path is not None:
         log = load_raw_log(str(log_path))
-        entries = log["entries"][: args.steps]
+        entries = log["entries"]
+        if args.steps is not None:
+            entries = entries[: args.steps]
         goals = [entry["goal_position"] for entry in entries]
+        enabled = np.array([bool(entry.get("torque_enable", True)) for entry in entries])
         recorded = np.array([entry["position"] for entry in entries])
         dt = log["dt"]
         mass, arm_mass, length = log["mass"], log["arm_mass"], log["length"]
         q0, dq0 = float(entries[0]["position"]), float(entries[0].get("speed", 0.0))
         provenance = log_path.name
     else:
-        # Nothing recorded: build the rig from the CLI and drive it ourselves.
+        # Nothing recorded: build the rig from the CLI and drive it with one of BAM's
+        # own identification trajectories, so the arm performs the very motion the
+        # params file was fitted from - torque-enable flag and all.
         dt, mass, arm_mass, length = args.dt, args.mass, args.arm_mass, args.length
-        goals = synthetic_commands(args.command, args.steps, dt)
-        entries = [{"torque_enable": True} for _ in goals]
-        log, recorded, q0, dq0 = None, None, 0.0, 0.0
-        provenance = f"synthetic ({args.command})"
+        trajectory = get_trajectory(args.command)
+        _, angles, enabled = sample(trajectory, dt, args.steps)
+        goals = [float(angle) for angle in angles]
+        entries = [{"torque_enable": bool(flag)} for flag in enabled]
+        log, recorded, q0, dq0 = None, None, args.initial_angle, 0.0
+        provenance = f"BAM trajectory {args.command!r} ({trajectory.duration:g}s)"
 
     params_file = None if args.params.lower() == "none" else resolve_params_file(args.params)
     firmware = firmware_overrides(log, args.motor)
 
+    # Rendering is decimated to roughly 60 frames per second of wall-clock time: at
+    # dt = 5 ms that is one frame every few physics steps. Scaling it with --speed
+    # keeps slow motion smooth instead of dropping to a stutter.
+    render_interval = max(1, round(args.speed / (60.0 * dt))) if args.speed > 0.0 else 1
+
     print(f"[scene] source    : {provenance}  ({len(goals)} steps, dt={dt:.6f}s)")
-    print(f"[scene] testbench : mass={mass} arm_mass={arm_mass} length={length}")
+    print(f"[scene] testbench : mass={mass} arm_mass={arm_mass} length={length}  "
+          f"start={q0:+.3f} rad")
     print(f"[scene] motor     : {args.motor}  params={params_file}")
     print("[scene] firmware  : " + (" ".join(f"{k}={v:g}" for k, v in firmware.items())
                                      or "(motor module defaults)"))
+    if args.visual:
+        print(f"[scene] playback  : speed={args.speed:g}x, rendering every "
+              f"{render_interval} physics step(s)")
+    if not enabled.all():
+        print(f"[scene] note      : torque is disabled for {int((~enabled).sum())} of "
+              f"{len(enabled)} steps; the arm back-drives under gravity there.")
 
     actuator_cfg = BamActuatorCfg(
         joint_names_expr=[".*"],
@@ -350,8 +388,20 @@ def main() -> int:
     urdf.write_text(build_urdf(mass, arm_mass, length))
 
     sim = SimulationContext(
-        SimulationCfg(dt=dt, device=args.device, gravity=(0.0, 0.0, GRAVITY))
+        SimulationCfg(
+            dt=dt,
+            render_interval=render_interval,
+            device=args.device,
+            gravity=(0.0, 0.0, GRAVITY),
+        )
     )
+    if args.visual:
+        # Frame the arm. It is only `length` long (15 cm by default) and hangs from
+        # the env origin, so the default camera leaves it a speck near the middle.
+        sim.set_camera_view(
+            eye=[2.3 * length, -2.3 * length, 1.0 * length],
+            target=[0.0, 0.0, -0.5 * length],
+        )
     scene = InteractiveScene(make_scene_cfg(str(urdf), dt, actuator_cfg))
     sim.reset()
 
@@ -359,31 +409,57 @@ def main() -> int:
     actuator = robot.actuators["joint"]
     device = robot.device
 
-    robot.write_joint_state_to_sim(
-        torch.full((1, 1), q0, device=device), torch.full((1, 1), dq0, device=device)
-    )
-    robot.reset()
-
     q_offset = float(getattr(actuator.motor, "q_offset", 0.0))
     gravity_gain = (mass + arm_mass / 2.0) * GRAVITY * length
 
-    positions, velocities = [], []
-    for goal in goals:
-        # Record the state the controller is about to act on (harness ordering).
-        positions.append(float(robot.data.joint_pos[0, 0]))
-        velocities.append(float(robot.data.joint_vel[0, 0]))
+    def rollout() -> tuple[list[float], list[float]]:
+        """One pass over the whole command sequence, paced for viewing.
 
-        robot.set_joint_position_target(torch.full((1, 1), float(goal), device=device))
+        Same ordering as ``offline_rollout.drive``: the state is recorded *before*
+        the step, and the controller sees the state it would have seen.
+        """
+        # Isaac Lab's documented way to restore an articulation: write the joint
+        # state, then call ``reset`` to drop the internal buffers *and* the
+        # actuators' own state - which is where the slew-limited internal target
+        # lives. Skipping it would leak one pass's target into the next.
+        robot.write_joint_state_to_sim(
+            torch.full((1, 1), q0, device=device), torch.full((1, 1), dq0, device=device)
+        )
+        robot.reset()
 
-        # Load-dependent friction needs the external torque. BAM passes the
-        # testbench bias here; the env has to supply it because PhysX will not.
-        q_physics = robot.data.joint_pos + q_offset
-        actuator.set_external_torque(gravity_gain * torch.sin(q_physics))
+        positions, velocities = [], []
+        wall_start = time.perf_counter()
+        for i, (goal, enable) in enumerate(zip(goals, enabled)):
+            # Record the state the controller is about to act on (harness ordering).
+            positions.append(float(robot.data.joint_pos[0, 0]))
+            velocities.append(float(robot.data.joint_vel[0, 0]))
 
-        robot.write_data_to_sim()  # runs actuator.compute()
-        sim.step()
-        robot.update(dt)
+            robot.set_joint_position_target(torch.full((1, 1), float(goal), device=device))
 
+            # Load-dependent friction needs the external torque. BAM passes the
+            # testbench bias here; the env has to supply it because PhysX will not.
+            q_physics = robot.data.joint_pos + q_offset
+            actuator.set_external_torque(gravity_gain * torch.sin(q_physics))
+            actuator.set_torque_enable(bool(enable))
+
+            robot.write_data_to_sim()  # runs actuator.compute()
+            sim.step(render=False)
+            robot.update(dt)
+
+            # Wait out the wall-clock time this step represents. Without this the
+            # whole run finishes in a fraction of a second, long before the viewport
+            # has drawn anything, so the window shows a pendulum that never moves.
+            if args.speed > 0.0:
+                remaining = wall_start + (i + 1) * dt / args.speed - time.perf_counter()
+                if remaining > 0.0:
+                    time.sleep(remaining)
+
+            if args.visual and i % render_interval == 0:
+                sim.render()
+
+        return positions, velocities
+
+    positions, velocities = rollout()
     isaac = {"positions": np.array(positions), "velocities": np.array(velocities)}
 
     # --- comparison 1: against the offline harness -------------------
@@ -444,17 +520,40 @@ def main() -> int:
         summarise("position", recorded)
 
     if args.csv:
-        columns = [np.array(goals), isaac["positions"], isaac["velocities"], offline["positions"]]
-        header = "goal,isaac_pos,isaac_vel,offline_pos"
+        columns = [np.array(goals), enabled.astype(float), isaac["positions"], isaac["velocities"]]
+        header = ["goal", "torque_enable", "isaac_pos", "isaac_vel"]
         if recorded is not None:
-            columns.insert(3, recorded)
-            header = "goal,isaac_pos,isaac_vel,recorded_pos,offline_pos"
-        np.savetxt(args.csv, np.column_stack(columns), delimiter=",", header=header, comments="")
+            columns.append(recorded)
+            header.append("recorded_pos")
+        columns.append(offline["positions"])
+        header.append("offline_pos")
+        np.savetxt(
+            args.csv, np.column_stack(columns), delimiter=",", header=",".join(header), comments=""
+        )
         print(f"\n[scene] wrote {args.csv}")
 
     print("\n[scene] done. A large 'vs offline' gap means the scene differs (timestep, "
           "\ninertia or armature). If you replayed a recording, a large 'vs recording' gap "
           "\nmeans the model disagrees with the servo - which is the one worth tuning.")
+
+    # --- keep the window useful after the run ----------------------
+    if args.visual and args.loop:
+        print("\n[scene] looping. Close the window (or Ctrl+C) to stop.")
+        try:
+            while simulation_app.is_running():
+                rollout()
+        except KeyboardInterrupt:
+            pass
+    elif args.visual:
+        print("\n[scene] window left open so you can look at the final pose. Close it (or "
+              "Ctrl+C)"
+              "\n[scene] to exit, or pass --loop to keep it moving.")
+        try:
+            while simulation_app.is_running():
+                sim.render()
+        except KeyboardInterrupt:
+            pass
+
     return 0
 
 
