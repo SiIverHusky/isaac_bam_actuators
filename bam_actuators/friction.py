@@ -100,6 +100,26 @@ def _abs(value: Any) -> Any:
     return abs(value)
 
 
+def _as_tensor(value: Any, like: torch.Tensor | None = None) -> torch.Tensor:
+    """Coerce a broadcastable input to a torch tensor.
+
+    The budget is documented to accept anything broadcastable, which has to include
+    plain Python and numpy numbers - BAM's scalar identification runs are float64
+    scalars. Some of the maths reaches for :func:`torch.sign` directly rather than
+    through :func:`_abs`, so a scalar there raises instead of broadcasting; making
+    the inputs tensor-shaped once, on entry, removes that whole class of trap.
+
+    :param value: A tensor, numpy scalar/array, or Python number.
+    :param like: Optional tensor to take the dtype and device from. Worth passing:
+        it keeps a float64 comparison float64 instead of rounding through float32.
+    """
+    if isinstance(value, torch.Tensor):
+        return value
+    dtype = like.dtype if like is not None else torch.get_default_dtype()
+    device = like.device if like is not None else None
+    return torch.as_tensor(value, dtype=dtype, device=device)
+
+
 class BamFrictionModel:
     r"""Torch implementation of the BAM friction budget.
 
@@ -283,6 +303,13 @@ class BamFrictionModel:
         :returns: Tuple ``(frictionloss, damping)`` -- the constant part [Nm] and
             the viscous coefficient [Nm/(rad/s)].
         """
+        # Scalars are a supported input, but the m6 gate signs the external torque
+        # directly, so normalise everything to tensors up front. The dtype follows
+        # motor_torque, which is where the caller's precision comes from.
+        motor_torque = _as_tensor(motor_torque)
+        external_torque = _as_tensor(external_torque, like=motor_torque)
+        dq = _as_tensor(dq, like=motor_torque)
+
         # Torque applied to the gearbox.
         if self.directional:
             gearbox_torque = (
@@ -364,6 +391,11 @@ class BamFrictionModel:
         :param dt: Physics timestep [s], required together with ``inertia``.
         :returns: Net joint torque [Nm] including friction.
         """
+        # Same normalisation as compute(), for the stopping-torque clip below.
+        motor_torque = _as_tensor(motor_torque)
+        external_torque = _as_tensor(external_torque, like=motor_torque)
+        dq = _as_tensor(dq, like=motor_torque)
+
         frictionloss, damping = self.compute(motor_torque, external_torque, dq)
 
         net_torque = motor_torque + external_torque

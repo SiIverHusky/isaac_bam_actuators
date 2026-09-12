@@ -15,6 +15,7 @@ isaac_bam_actuators/
 │   ├── __init__.py             # lazy public API
 │   ├── friction.py             # torch port of BAM's friction budget (m1–m6)
 │   ├── trajectory.py           # port of BAM's identification motions
+│   ├── testbench.py            # the URDF realising BAM's pendulum testbench
 │   ├── params.py               # locates the bundled identified models
 │   ├── params/                 # identified models, shipped with the extension
 │   │   └── sts3215/m1..m6.json
@@ -31,6 +32,7 @@ isaac_bam_actuators/
     ├── test_friction.py        # the m1–m6 maths
     ├── test_motors.py          # each control law vs BAM's actuator class
     ├── test_trajectory.py      # the trajectory port vs bam.trajectory
+    ├── test_testbench.py       # the rig geometry vs bam.testbench.Pendulum
     └── test_sts3215_m5.py      # real identified models, end to end
 ```
 
@@ -100,15 +102,17 @@ python -m pip install -e /path/to/isaac_bam_actuators
 #    before you debug anything about the scene.
 python -m pip install pytest
 BAM_ROOT=/path/to/BAM python -m pytest tests/ -q
-# -> 86 passed. Without BAM_ROOT, 61 pass and the 25 parity tests skip.
+# -> 97 passed. Without BAM_ROOT, 71 pass and the 26 parity tests skip.
 
 # 3. Check the Isaac Lab integration without building a scene.
 python scripts/check_isaac_actuator.py
 
 # 4. Drive a pendulum whose dynamics match BAM's testbench, through BAM's own
-#    identification trajectories.
+#    identification trajectories - one model, or several side by side.
 python scripts/pendulum_scene.py --visual --loop             # watch it, over and over
 python scripts/pendulum_scene.py                             # headless, paced in real time
+python scripts/pendulum_scene.py --visual --model1 m1 --model2 m6
+python scripts/pendulum_scene.py --visual --models m1 m3 m6  # any number
 python scripts/pendulum_scene.py --visual --command lift_and_drop --speed 0.25
 python scripts/pendulum_scene.py --command nothing --initial-angle 1.2 --visual
 python scripts/pendulum_scene.py --list-motors                # valid --motor values
@@ -203,6 +207,39 @@ those two trajectories exist to measure.
 gravity equilibrium, so it genuinely does not move. Pass `--initial-angle 1.2` to
 start it off-equilibrium if you want to watch it fall under gravity alone.
 
+### Comparing models side by side
+
+`--model1`/`--model2` put two models in the scene at once; `--models` takes any
+number:
+
+```bash
+python scripts/pendulum_scene.py --visual --model1 m1 --model2 m6
+python scripts/pendulum_scene.py --visual --models m1 m3 m5
+```
+
+A bare variant name is expanded against `--motor`, so `--model1 m1` means
+`<motor>/m1.json`; a `motor/model` reference or a path also works. `--params` is
+ignored (with a note) once any `--model*` is given.
+
+Every model gets its own pendulum, colour-coded by variant — `m1` red, `m2`
+orange, `m3` yellow, `m4` green, `m5` blue, `m6` violet — and printed as a legend at
+startup. All of them receive the *same* command on the same physics step, so any
+difference on screen is the friction model and nothing else.
+
+Structurally the arms are the joints of **one** articulation rather than separate
+assets. That is what makes per-model parameters possible: an articulation can carry
+several actuator groups, each covering a different subset of joints, and each group
+is its own `BamActuator` reading its own params file. Being a single articulation
+also means the arms share a physics step and a `robot.update()`, which is what makes
+the comparison fair to begin with. The report runs the offline harness once per
+model, so you get a per-model agreement table rather than a single figure.
+
+Worth knowing before you look: the six models do not diverge dramatically. On
+`steps` with the STS3215 params, m1 and m2 land within 0.003 rad of each other, while
+m3–m6 sit 0.04–0.08 rad from m1 — a couple of centimetres at the tip. BAM's
+refinements are real but modest on this rig, so expect subtle differences rather than
+dramatically different motion.
+
 ### Watching it move
 
 A 6 s trajectory simulates in well under a second, so an unpaced run is over
@@ -211,8 +248,10 @@ never moves. Two things fix that, both on by default when `--visual` is passed:
 
 - **Pacing.** The loop sleeps to hold `--speed` (default `1.0`, real time). `0.25`
 is quarter speed, `0` runs as fast as possible.
-- **Framing.** `sim.set_camera_view()` is pointed at the arm, which is only 15 cm
-long and otherwise a speck near the world origin.
+- **Framing.** `sim.set_camera_view()` is pointed at the whole row of arms. They all
+rotate about the same axis, so looking along it shows every swing face-on, and they
+are spaced along the perpendicular direction so they read as a row instead of hiding
+behind one another. Without this, 15 cm arms are specks near the world origin.
 
 Rendering is decimated to about 60 wall-clock frames per second
 (`SimulationCfg.render_interval`, scaling with `--speed` so slow motion stays
@@ -384,6 +423,7 @@ python -m pytest tests/
 | `test_friction.py` | the m1–m6 budget maths |
 | `test_motors.py` | each control law vs BAM's actuator class |
 | `test_trajectory.py` | the trajectory port vs `bam.trajectory`, sample-by-sample, plus the `torque_enable` boundaries |
+| `test_testbench.py` | the rig geometry - the physics is read back out of the generated URDF and checked against `bam.testbench.Pendulum` |
 | `test_sts3215_m5.py` | the six bundled models, end to end |
 | `test_offline_rollout.py` | **full composition**: BAM's pendulum loop driven by our motor + friction, step-by-step against `bam.simulate.Simulator` on a recorded log |
 

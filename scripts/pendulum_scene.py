@@ -28,15 +28,23 @@ identification trajectories** (``--command``), the same motions the params file 
 fitted from - including their ``torque_enable`` flag, so ``nothing`` and
 ``lift_and_drop`` let the arm fall unpowered under gravity alone.
 
+**Comparing models.** ``--model1``/``--model2`` (or ``--models`` for any number) put
+several models in the scene at once, each as its own pendulum driven by the *same*
+command, so the only difference between them is the friction model. The arms are
+colour-coded by variant (m1..m6), one joint each, and each gets its own actuator group
+and params file - see :mod:`bam_actuators.testbench`.
+
 **Watching it.** A 6 s trajectory simulates in a fraction of a second, so without
 pacing the whole run is over before the viewport draws a first frame. ``--speed``
-plays it back in real time (or slower), and the camera is framed on the arm, which
-is only 15 cm long.
+plays it back in real time (or slower), and the camera is framed on the row of arms,
+which are only 15 cm long.
 
 Usage::
 
     python scripts/pendulum_scene.py                              # headless, real-time paced
     python scripts/pendulum_scene.py --visual --loop              # watch it, over and over
+    python scripts/pendulum_scene.py --visual --model1 m1 --model2 m6
+    python scripts/pendulum_scene.py --visual --models m1 m3 m6   # any number
     python scripts/pendulum_scene.py --visual --command lift_and_drop --speed 0.25
     python scripts/pendulum_scene.py --command nothing --params none
     python scripts/pendulum_scene.py --command nothing --initial-angle 1.2 --visual
@@ -46,6 +54,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tempfile
 import time
@@ -93,8 +102,36 @@ parser.add_argument(
 )
 parser.add_argument("--motor", type=str, default="sts3215", help="Motor name as BAM's params files write it, e.g. 'sts3215' or 'md01' - not the "
     "module filename. The params file's 'actuator' key overrides this. See --list-motors.")
-parser.add_argument("--params", type=str, default="sts3215/m5", help="Params file, or 'none'.")
+parser.add_argument(
+    "--params",
+    type=str,
+    default=None,
+    help="Params file for the single-pendulum case, or 'none'. Default: sts3215/m5. "
+    "Ignored when --model1/--model2/--models are given.",
+)
 parser.add_argument("--list-motors", action="store_true", help="List valid --motor values and exit.")
+# Which models to show. One pendulum each, so they can be compared side by side.
+parser.add_argument(
+    "--model1",
+    type=str,
+    default=None,
+    help="Show this model as the first pendulum, e.g. 'm1'. A bare variant name is "
+    "resolved against --motor, so 'm1' means '<motor>/m1.json'.",
+)
+parser.add_argument(
+    "--model2",
+    type=str,
+    default=None,
+    help="Show this model as the second pendulum, e.g. 'm5'.",
+)
+parser.add_argument(
+    "--models",
+    type=str,
+    nargs="+",
+    default=None,
+    help="General form of --model1/--model2: any number of models to show side by "
+    "side, e.g. --models m1 m3 m5.",
+)
 # Rig and drive, used when there is no recording.
 parser.add_argument("--mass", type=float, default=0.5, help="Tip mass [kg].")
 parser.add_argument("--arm-mass", type=float, default=0.02, help="Arm mass [kg].")
@@ -154,75 +191,38 @@ from isaaclab.utils import configclass  # noqa: E402
 
 from bam_actuators.actuators import BamActuatorCfg  # noqa: E402
 from bam_actuators.params import resolve_params_file  # noqa: E402
+from bam_actuators.testbench import (  # noqa: E402
+    GRAVITY,
+    Arm,
+    arm_for,
+    build_urdf,
+    pendulum_spacing,
+)
 
 from offline_rollout import OfflineSimulator, drive, load_raw_log  # noqa: E402
 
-#: Must match BAM's ``bam.testbench.Pendulum`` exactly.
-GRAVITY = -9.80665
-#: Small, so the tip mass behaves like the point mass BAM models it as.
-TIP_RADIUS = 0.01
-ROD_RADIUS = 0.005
+# The rig geometry, the model colour palette and BAM's gravity live in the package so
+# they can be checked without Isaac Sim - see bam_actuators/testbench.py.
+
+
+def resolve_model_arg(value: str, motor: str) -> str:
+    """Resolve a ``--model``-style reference to a params file.
+
+    A bundled variant may be given as a bare variant name (``m5``), which is
+    expanded against ``--motor``, or in any form :func:`resolve_params_file`
+    already accepts.
+
+    :param value: e.g. ``"m5"``, ``"sts3215/m5"``, or a path to a ``.json``.
+    :param motor: Motor name used to expand a bare variant name.
+    """
+    if "/" in value or value.endswith(".json"):
+        return resolve_params_file(value)
+    return resolve_params_file(f"{motor}/{value}")
 
 
 def default_log() -> Path:
     """The recording the parity tests use, if BAM's checkout is where we expect."""
     return BAM_ROOT / "data_raw" / "2026-09-10_15h22m23.json"
-
-
-def build_urdf(mass: float, arm_mass: float, length: float) -> str:
-    """A pendulum whose rigid-body dynamics equal BAM's testbench.
-
-    Derived quantities, with ``m = mass + arm_mass``:
-
-    * ``d = (mass + arm_mass / 2) * L / m`` -- COM distance that reproduces the
-      gravity torque ``(mass + arm_mass/2) * g * L * sin(q)``;
-    * ``I_com = I_pivot - m * d^2`` -- parallel-axis shift so the swing inertia
-      about the pivot is ``I_pivot = mass*L^2 + (arm_mass/3)*L^2``.
-
-    The joint is continuous about +Y, so ``q = 0`` is the arm hanging down and
-    positive ``q`` is counter-clockwise - BAM's convention, which makes
-    ``tau_y = -(mass + arm_mass/2) * 9.80665 * L * sin(q)`` on both sides.
-
-    Everything lives on one link on purpose: a separate tip link joined by a fixed
-    joint would be merged by the importer, perturbing the inertia derived above.
-    There is no ``<collision>`` geometry either - nothing in this scene should
-    contact anything, and a shape here would be a chance for the scene to stop
-    matching BAM's contact-free single-axis model.
-    """
-    total_mass = mass + arm_mass
-    com_distance = (mass + arm_mass / 2.0) * length / total_mass
-    inertia_pivot = mass * length**2 + (arm_mass / 3.0) * length**2
-    inertia_com = inertia_pivot - total_mass * com_distance**2
-    # Isotropic: only Iyy matters for this 1-DOF swing, and it is exact.
-    i = inertia_com
-
-    return f"""<?xml version="1.0"?>
-<robot name="bam_pendulum">
-  <link name="base"/>
-  <joint name="pivot" type="continuous">
-    <parent link="base"/>
-    <child link="arm"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <dynamics damping="0.0" friction="0.0"/>
-  </joint>
-  <link name="arm">
-    <inertial>
-      <origin xyz="0 0 {-com_distance:.12g}" rpy="0 0 0"/>
-      <mass value="{total_mass:.12g}"/>
-      <inertia ixx="{i:.12g}" ixy="0" ixz="0" iyy="{i:.12g}" iyz="0" izz="{i:.12g}"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 {-length / 2.0:.12g}" rpy="0 0 0"/>
-      <geometry><cylinder radius="{ROD_RADIUS}" length="{length:.12g}"/></geometry>
-    </visual>
-    <visual>
-      <origin xyz="0 0 {-length:.12g}" rpy="0 0 0"/>
-      <geometry><sphere radius="{TIP_RADIUS}"/></geometry>
-    </visual>
-  </link>
-</robot>
-"""
 
 
 def firmware_overrides(log: dict | None, motor: str) -> dict:
@@ -261,16 +261,27 @@ def firmware_overrides(log: dict | None, motor: str) -> dict:
         return {"vin": log["vin"], "firmware_kp": log["kp"]}
 
 
-def make_scene_cfg(urdf_path: str, dt: float, actuator_cfg: BamActuatorCfg, num_envs: int = 1):
-    """Scene with the pendulum, a ground plane and a light."""
+def make_scene_cfg(urdf_path: str, actuators: dict[str, BamActuatorCfg], num_envs: int = 1):
+    """Scene with the articulated pendulum rig and a light.
+
+    :param actuators: One actuator group per pendulum, keyed by the name `main` will
+        look the actuator up by. Each group has its own ``joint_names_expr``, so each
+        one reads its own params file.
+    """
 
     @configclass
     class _PendulumSceneCfg(InteractiveSceneCfg):
-        """A single pendulum anchored to the world.
+        """Every pendulum, as the joints of one articulation anchored to the world.
 
-        Deliberately **no ground plane**: the joint sits at the env origin and the arm
-        hangs to ``z = -length``, so a floor at ``z = 0`` would intersect it and
+        Deliberately **no ground plane**: the pivots sit at the env origin and the arms
+        hang to ``z = -length``, so a floor at ``z = 0`` would intersect them and
         introduce contacts that BAM's testbench does not have.
+
+        One articulation rather than one asset per model, because that is what makes
+        per-model parameters possible: an articulation may carry several actuator
+        groups, each covering a different subset of joints, and each group is its own
+        :class:`BamActuator` reading its own params file. The arms are also then
+        guaranteed to share a physics step, which is what makes the comparison fair.
         """
 
         light = AssetBaseCfg(
@@ -297,13 +308,42 @@ def make_scene_cfg(urdf_path: str, dt: float, actuator_cfg: BamActuatorCfg, num_
                     ),
                 ),
             ),
+            # Every joint starts hanging straight down. The arms are placed by the
+            # URDF's own `<origin>` offsets, so no joint names are needed here.
             init_state=ArticulationCfg.InitialStateCfg(
-                joint_pos={"pivot": 0.0}, joint_vel={"pivot": 0.0}
+                joint_pos={".*": 0.0}, joint_vel={".*": 0.0}
             ),
-            actuators={"joint": actuator_cfg},
+            actuators=actuators,
         )
 
     return _PendulumSceneCfg(num_envs=num_envs, env_spacing=2.0)
+
+
+def colour_links(root_prim: str, pendulums: list[Arm]) -> None:
+    """Reinforce the per-arm colours with an explicit material binding.
+
+    The URDF already carries a ``<material>`` per arm, so the colour travels with the
+    asset. Not every importer is guaranteed to honour that, and ``UrdfConverterCfg``
+    has no material option of its own, so bind a spawned material on top as well.
+
+    Cosmetic and best-effort: if this fails the arms keep whatever the asset gave them,
+    which is worth a warning but never worth failing the run.
+
+    :param root_prim: The articulation's prim path, e.g. ``/World/envs/env_0/pendulum``.
+    :param pendulums: The arms whose link names and colours to use.
+    """
+    for pendulum in pendulums:
+        material_path = f"/World/Looks/{pendulum.slug}"
+        try:
+            material = sim_utils.PreviewSurfaceCfg(diffuse_color=pendulum.colour)
+            material.func(material_path, material)
+            sim_utils.bind_visual_material(
+                f"{root_prim}/{pendulum.link_name}", material_path
+            )
+        except Exception as exc:  # noqa: BLE001 - cosmetic, never fatal
+            print(f"[scene] could not bind a colour to {pendulum.link_name}: {exc}")
+            print("[scene]   the arms keep the <material> from the URDF instead.")
+            return
 
 
 def main() -> int:
@@ -347,7 +387,33 @@ def main() -> int:
         log, recorded, q0, dq0 = None, None, args.initial_angle, 0.0
         provenance = f"BAM trajectory {args.command!r} ({trajectory.duration:g}s)"
 
-    params_file = None if args.params.lower() == "none" else resolve_params_file(args.params)
+    # Which pendulums to show, and which model drives each. With no --model* flag
+    # there is exactly one, chosen by --params - the original behaviour.
+    requested = [value for value in (args.model1, args.model2) if value is not None]
+    requested += [value for group in (args.models or []) for value in group.split(",")]
+
+    if requested:
+        if args.params is not None:
+            print(f"[scene] note: --params {args.params!r} ignored; --model* picks the models.")
+        pendulums: list[Arm] = []
+        for value in requested:
+            path = resolve_model_arg(value, args.motor)
+            label = Path(path).stem
+            if any(existing.label == label for existing in pendulums):
+                print(
+                    f"[scene] {label!r} requested twice; each model needs its own pendulum.",
+                    file=sys.stderr,
+                )
+                return 1
+            pendulums.append(arm_for(label, path))
+    else:
+        params_arg = args.params if args.params is not None else "sts3215/m5"
+        if params_arg.lower() == "none":
+            pendulums = [arm_for("model")]
+        else:
+            resolved = resolve_params_file(params_arg)
+            pendulums = [arm_for(Path(resolved).stem, resolved)]
+
     firmware = firmware_overrides(log, args.motor)
 
     # Rendering is decimated to roughly 60 frames per second of wall-clock time: at
@@ -358,9 +424,13 @@ def main() -> int:
     print(f"[scene] source    : {provenance}  ({len(goals)} steps, dt={dt:.6f}s)")
     print(f"[scene] testbench : mass={mass} arm_mass={arm_mass} length={length}  "
           f"start={q0:+.3f} rad")
-    print(f"[scene] motor     : {args.motor}  params={params_file}")
+    print(f"[scene] motor     : {args.motor}")
     print("[scene] firmware  : " + (" ".join(f"{k}={v:g}" for k, v in firmware.items())
                                      or "(motor module defaults)"))
+    print(f"[scene] pendulums : {len(pendulums)}")
+    for pendulum in pendulums:
+        swatch = "".join(f"{int(round(255 * channel)):02x}" for channel in pendulum.colour)
+        print(f"    {pendulum.label:<10} #{swatch}  params={pendulum.params_file}")
     if args.visual:
         print(f"[scene] playback  : speed={args.speed:g}x, rendering every "
               f"{render_interval} physics step(s)")
@@ -368,24 +438,28 @@ def main() -> int:
         print(f"[scene] note      : torque is disabled for {int((~enabled).sum())} of "
               f"{len(enabled)} steps; the arm back-drives under gravity there.")
 
-    actuator_cfg = BamActuatorCfg(
-        joint_names_expr=[".*"],
-        effort_limit=100.0,
-        velocity_limit=100.0,
-        physics_dt=dt,  # must equal the sim dt or the slew limiter is wrong
-        motor=args.motor,
-        params_file=params_file,
-        # All friction lives in the actuator model, so the solver must add none of
-        # its own or it would be double-counted.
-        friction=0.0,
-        dynamic_friction=0.0,
-        viscous_friction=0.0,
-        **firmware,
-    )
+    actuator_cfgs = {
+        pendulum.slug: BamActuatorCfg(
+            # Anchored: an unanchored "joint_m1" would also match "joint_m10".
+            joint_names_expr=[f"^{re.escape(pendulum.joint_name)}$"],
+            effort_limit=100.0,
+            velocity_limit=100.0,
+            physics_dt=dt,  # must equal the sim dt or the slew limiter is wrong
+            motor=args.motor,
+            params_file=pendulum.params_file,
+            # All friction lives in the actuator model, so the solver must add none
+            # of its own or it would be double-counted.
+            friction=0.0,
+            dynamic_friction=0.0,
+            viscous_friction=0.0,
+            **firmware,
+        )
+        for pendulum in pendulums
+    }
 
     # --- build the scene -------------------------------------------
     urdf = Path(tempfile.mkdtemp()) / "bam_pendulum.urdf"
-    urdf.write_text(build_urdf(mass, arm_mass, length))
+    urdf.write_text(build_urdf(mass, arm_mass, length, pendulums))
 
     sim = SimulationContext(
         SimulationCfg(
@@ -396,53 +470,80 @@ def main() -> int:
         )
     )
     if args.visual:
-        # Frame the arm. It is only `length` long (15 cm by default) and hangs from
-        # the env origin, so the default camera leaves it a speck near the middle.
+        # Frame the whole row. The arms all rotate about +Y, so looking along -Y shows
+        # every swing face-on; they are spread along X so they read as a row instead of
+        # hiding behind one another. Without this the default camera leaves arms a few
+        # tens of centimetres long as specks near the world origin.
+        span = max(
+            length, (len(pendulums) - 1) * pendulum_spacing(length) / 2.0 + length
+        )
         sim.set_camera_view(
-            eye=[2.3 * length, -2.3 * length, 1.0 * length],
+            eye=[0.25 * span, -2.6 * span, 0.9 * span],
             target=[0.0, 0.0, -0.5 * length],
         )
-    scene = InteractiveScene(make_scene_cfg(str(urdf), dt, actuator_cfg))
+    scene = InteractiveScene(make_scene_cfg(str(urdf), actuator_cfgs))
     sim.reset()
 
     robot = scene["pendulum"]
-    actuator = robot.actuators["joint"]
     device = robot.device
+    num_joints = robot.num_joints
 
-    q_offset = float(getattr(actuator.motor, "q_offset", 0.0))
+    # One env, so the regex namespace resolves to env_0. If the scene already
+    # substituted it, the replace is a no-op either way.
+    colour_links(
+        robot.cfg.prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_0"), pendulums
+    )
+
+    # Look the joints up by name rather than trusting the articulation's joint order.
+    joint_ids = {p.slug: robot.find_joints(p.joint_name)[0][0] for p in pendulums}
+    actuators = {p.slug: robot.actuators[p.slug] for p in pendulums}
+    offsets = {
+        p.slug: float(getattr(actuators[p.slug].motor, "q_offset", 0.0)) for p in pendulums
+    }
     gravity_gain = (mass + arm_mass / 2.0) * GRAVITY * length
 
-    def rollout() -> tuple[list[float], list[float]]:
+    def rollout() -> tuple[dict[str, list[float]], dict[str, list[float]]]:
         """One pass over the whole command sequence, paced for viewing.
 
         Same ordering as ``offline_rollout.drive``: the state is recorded *before*
-        the step, and the controller sees the state it would have seen.
+        the step, and the controllers see the state they would have seen.
         """
         # Isaac Lab's documented way to restore an articulation: write the joint
         # state, then call ``reset`` to drop the internal buffers *and* the
         # actuators' own state - which is where the slew-limited internal target
         # lives. Skipping it would leak one pass's target into the next.
         robot.write_joint_state_to_sim(
-            torch.full((1, 1), q0, device=device), torch.full((1, 1), dq0, device=device)
+            torch.full((1, num_joints), q0, device=device),
+            torch.full((1, num_joints), dq0, device=device),
         )
         robot.reset()
 
-        positions, velocities = [], []
+        positions = {p.slug: [] for p in pendulums}
+        velocities = {p.slug: [] for p in pendulums}
         wall_start = time.perf_counter()
         for i, (goal, enable) in enumerate(zip(goals, enabled)):
-            # Record the state the controller is about to act on (harness ordering).
-            positions.append(float(robot.data.joint_pos[0, 0]))
-            velocities.append(float(robot.data.joint_vel[0, 0]))
+            # Record the state the controllers are about to act on (harness ordering).
+            for pendulum in pendulums:
+                index = joint_ids[pendulum.slug]
+                positions[pendulum.slug].append(float(robot.data.joint_pos[0, index]))
+                velocities[pendulum.slug].append(float(robot.data.joint_vel[0, index]))
 
-            robot.set_joint_position_target(torch.full((1, 1), float(goal), device=device))
+            # Every pendulum gets the same command, so the only difference between
+            # them is the model under test.
+            robot.set_joint_position_target(
+                torch.full((1, num_joints), float(goal), device=device)
+            )
 
-            # Load-dependent friction needs the external torque. BAM passes the
-            # testbench bias here; the env has to supply it because PhysX will not.
-            q_physics = robot.data.joint_pos + q_offset
-            actuator.set_external_torque(gravity_gain * torch.sin(q_physics))
-            actuator.set_torque_enable(bool(enable))
+            for pendulum in pendulums:
+                key = pendulum.slug
+                # Load-dependent friction needs the external torque. BAM passes the
+                # testbench bias here; the env has to supply it because PhysX will
+                # not, and each arm's bias depends on its own angle.
+                q_physics = robot.data.joint_pos[0, joint_ids[key]] + offsets[key]
+                actuators[key].set_external_torque(gravity_gain * torch.sin(q_physics))
+                actuators[key].set_torque_enable(bool(enable))
 
-            robot.write_data_to_sim()  # runs actuator.compute()
+            robot.write_data_to_sim()  # runs every actuator group's compute()
             sim.step(render=False)
             robot.update(dt)
 
@@ -460,29 +561,12 @@ def main() -> int:
         return positions, velocities
 
     positions, velocities = rollout()
-    isaac = {"positions": np.array(positions), "velocities": np.array(velocities)}
 
-    # --- comparison 1: against the offline harness -------------------
+    # --- comparison: against the offline harness, once per model -----
     import json
 
     from bam_actuators.friction import BamFrictionModel
     from bam_actuators.motors import get_motor
-
-    # Use the motor the actuator actually resolved - the params file can override
-    # --motor - so both sides are guaranteed to run the same control law.
-    our_motor = get_motor(actuator.motor_name)()
-    our_motor.set_params(
-        {
-            "kp": actuator.motor.kp,
-            "vin": actuator.motor.vin,
-            "error_gain": actuator.motor.error_gain,
-            "max_pwm": actuator.motor.max_pwm,
-        }
-    )
-    our_friction = BamFrictionModel.from_params({}, model=None)
-    if params_file:
-        our_motor.set_params(json.loads(Path(params_file).read_text()))
-        our_friction = BamFrictionModel.from_json(params_file)
 
     class _Testbench:
         """BAM's ``testbench.Pendulum``, inlined.
@@ -497,36 +581,70 @@ def main() -> int:
         def compute_mass(self, q, dq):
             return mass * length**2 + (arm_mass / 3.0) * length**2
 
-    harness = OfflineSimulator(_Testbench(), our_motor, our_friction, dt, q_offset=q_offset)
-    harness.reset(q0, dq0)
-    offline = drive(harness, entries, goals)
+    offline = {}
+    for pendulum in pendulums:
+        live = actuators[pendulum.slug]
+        # Use the motor the actuator actually resolved - a params file can override
+        # --motor - so both sides are guaranteed to run the same control law.
+        motor = get_motor(live.motor_name)()
+        motor.set_params(
+            {
+                "kp": live.motor.kp,
+                "vin": live.motor.vin,
+                "error_gain": live.motor.error_gain,
+                "max_pwm": live.motor.max_pwm,
+            }
+        )
+        friction = BamFrictionModel.from_params({}, model=None)
+        if pendulum.params_file:
+            motor.set_params(json.loads(Path(pendulum.params_file).read_text()))
+            friction = BamFrictionModel.from_json(pendulum.params_file)
+
+        harness = OfflineSimulator(
+            _Testbench(), motor, friction, dt, q_offset=offsets[pendulum.slug]
+        )
+        harness.reset(q0, dq0)
+        offline[pendulum.slug] = drive(harness, entries, goals)
 
     # --- report -----------------------------------------------------
-    def summarise(label: str, reference: np.ndarray) -> None:
-        delta = isaac["positions"] - reference
-        print(f"  {label:<28} max|dq|={np.abs(delta).max():.6f} rad   "
-              f"rms={np.sqrt((delta**2).mean()):.6f} rad")
+    def gap(measured: np.ndarray, reference: np.ndarray) -> str:
+        difference = measured - reference
+        return (
+            f"max|dq|={np.abs(difference).max():.6f}  "
+            f"rms={np.sqrt((difference**2).mean()):.6f}"
+        )
 
-    print(f"\n[scene] {len(positions)} steps simulated")
-    finals = f"isaac={positions[-1]:+.4f}  offline={offline['positions'][-1]:+.4f}"
-    if recorded is not None:
-        finals += f"  recorded={recorded[-1]:+.4f}"
-    print(f"  final position : {finals} rad")
-
-    print("  Isaac vs offline harness (same model, different integrator):")
-    summarise("position", offline["positions"])
-    if recorded is not None:
-        print("  Isaac vs the recording (model vs physical servo):")
-        summarise("position", recorded)
+    print(f"\n[scene] {len(goals)} steps simulated, {len(pendulums)} pendulum(s)")
+    for pendulum in pendulums:
+        key = pendulum.slug
+        # A params file can override --motor, so label each row with what it loaded.
+        row = (
+            f"  {pendulum.label:<8} motor={actuators[key].motor_name:<8}"
+            f" final isaac={positions[key][-1]:+.4f}"
+            f"  offline={offline[key]['positions'][-1]:+.4f}"
+        )
+        if recorded is not None:
+            row += f"  recorded={recorded[-1]:+.4f}"
+        print(row)
+        measured = np.array(positions[key])
+        print(f"  {'':<8} Isaac vs offline harness: {gap(measured, offline[key]['positions'])} rad")
+        if recorded is not None:
+            print(f"  {'':<8} Isaac vs recording:       {gap(measured, recorded)} rad")
 
     if args.csv:
-        columns = [np.array(goals), enabled.astype(float), isaac["positions"], isaac["velocities"]]
-        header = ["goal", "torque_enable", "isaac_pos", "isaac_vel"]
+        columns = [np.array(goals), enabled.astype(float)]
+        header = ["goal", "torque_enable"]
         if recorded is not None:
             columns.append(recorded)
             header.append("recorded_pos")
-        columns.append(offline["positions"])
-        header.append("offline_pos")
+        for pendulum in pendulums:
+            key = pendulum.slug
+            columns += [
+                np.array(positions[key]),
+                np.array(velocities[key]),
+                offline[key]["positions"],
+            ]
+            header += [f"{key}_isaac_pos", f"{key}_isaac_vel", f"{key}_offline_pos"]
         np.savetxt(
             args.csv, np.column_stack(columns), delimiter=",", header=",".join(header), comments=""
         )
