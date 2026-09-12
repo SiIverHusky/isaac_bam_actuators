@@ -113,6 +113,7 @@ python scripts/pendulum_scene.py --visual --loop             # watch it, over an
 python scripts/pendulum_scene.py                             # headless, paced in real time
 python scripts/pendulum_scene.py --visual --model1 m1 --model2 m6
 python scripts/pendulum_scene.py --visual --models m1 m3 m6  # any number
+python scripts/pendulum_scene.py --visual --models m1 m6 --overlay  # same pivot
 python scripts/pendulum_scene.py --visual --command lift_and_drop --speed 0.25
 python scripts/pendulum_scene.py --command nothing --initial-angle 1.2 --visual
 python scripts/pendulum_scene.py --list-motors                # valid --motor values
@@ -233,6 +234,25 @@ is its own `BamActuator` reading its own params file. Being a single articulatio
 also means the arms share a physics step and a `robot.update()`, which is what makes
 the comparison fair to begin with. The report runs the offline harness once per
 model, so you get a per-model agreement table rather than a single figure.
+
+**Overlaying them (`--overlay`).** By default the arms are spread out so they read as
+a row. `--overlay` instead puts every arm on the *same* pivot, so their arcs coincide
+exactly and the only thing that can separate them is the friction model.
+
+That is exact rather than approximate. The arms are offset only along **Y**, their
+own rotation axis, and rotating about the Y line through `(0, y, 0)` is the same
+rotation as about the Y line through the origin; the COM keeps its X and Z, so the
+gravity torque is unchanged too. The `<inertial>` block is byte-identical between the
+two layouts, which `tests/test_testbench.py` asserts.
+
+Overlapping the arcs is safe because the rig emits **no collision geometry at all** —
+no `<collision>` elements anywhere, plus `self_collision=False` and
+`collision_from_visuals=False`. Nothing can touch anything, so two arms may disagree
+wildly without the solver caring. There is a test for that too.
+
+Because the arms are separated along the view axis in this mode, the camera is yawed
+off it: looking straight down the rotation axis would hide every arm but the nearest.
+When the models agree you see a single rod; the fan that opens up is the difference.
 
 Worth knowing before you look: the six models do not diverge dramatically. On
 `steps` with the STS3215 params, m1 and m2 land within 0.003 rad of each other, while

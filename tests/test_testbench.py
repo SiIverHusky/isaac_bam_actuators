@@ -18,11 +18,14 @@ import pytest
 from bam_actuators.testbench import (
     GRAVITY,
     MODEL_COLOURS,
+    OVERLAY_PITCH,
+    ROD_RADIUS,
     UNKNOWN_COLOUR,
     Arm,
     arm_for,
     build_urdf,
     pendulum_spacing,
+    pivot_offset,
 )
 
 from bam_paths import bam_root
@@ -119,6 +122,78 @@ def test_a_lone_arm_sits_on_the_origin():
     robot = ET.fromstring(build_urdf(MASS, ARM_MASS, LENGTH, [arm_for("m5")]))
 
     assert float(robot.find("joint").find("origin").get("xyz").split()[0]) == 0.0
+
+
+def test_pivot_offset_is_symmetric_in_both_layouts():
+    """So the camera framing is centred, whichever layout is in use."""
+    assert pivot_offset(0, 1, LENGTH, overlay=False) == (0.0, 0.0, 0.0)
+    assert pivot_offset(1, 2, LENGTH, overlay=True) == (0.0, OVERLAY_PITCH / 2.0, 0.0)
+
+    for overlay in (False, True):
+        offsets = [pivot_offset(index, 4, LENGTH, overlay) for index in range(4)]
+        for axis in range(3):
+            assert sum(offset[axis] for offset in offsets) == pytest.approx(0.0)
+
+
+# ----------------------------------------------------------------------
+# Overlaying
+# ----------------------------------------------------------------------
+
+
+def test_overlaid_arms_share_one_pivot_in_the_swing_plane():
+    """Every arm must pivot on the *same point*, offset only along its own axis.
+
+    That is what makes the overlaid rig dynamically identical to a single pendulum:
+    rotating about the Y line through ``(0, y, 0)`` is the same rotation as about the Y
+    line through the origin, and the COM keeps its X and Z, so the gravity torque is
+    unchanged too. The arms then trace the same arc and only the model separates them.
+    """
+    robot = ET.fromstring(
+        build_urdf(MASS, ARM_MASS, LENGTH, [arm_for("m1"), arm_for("m5")], overlay=True)
+    )
+
+    ys = []
+    for joint in robot.findall("joint"):
+        x, y, z = (float(value) for value in joint.find("origin").get("xyz").split())
+        assert (x, z) == (0.0, 0.0), "an overlaid arm must pivot in the swing plane"
+        assert joint.find("axis").get("xyz") == "0 1 0", "the offset must be along the axis"
+        ys.append(y)
+
+    # Really at different depths - coincident surfaces would z-fight.
+    assert len(set(ys)) == len(ys)
+
+
+def test_overlaying_changes_nothing_but_the_joint_origins():
+    """The two layouts must be dynamically identical: same links, byte for byte."""
+    arms = [arm_for("m1"), arm_for("m3"), arm_for("m6")]
+    spaced = ET.fromstring(build_urdf(MASS, ARM_MASS, LENGTH, arms, overlay=False))
+    overlaid = ET.fromstring(build_urdf(MASS, ARM_MASS, LENGTH, arms, overlay=True))
+
+    assert [ET.tostring(link) for link in spaced.findall("link")] == [
+        ET.tostring(link) for link in overlaid.findall("link")
+    ]
+    assert len(spaced.findall("joint")) == len(overlaid.findall("joint")) == len(arms)
+
+
+def test_overlaid_pitch_clears_the_visual_rods():
+    """Rods on the same arc must sit side by side, not through one another."""
+    assert OVERLAY_PITCH >= 2 * ROD_RADIUS
+
+
+def test_the_rig_carries_no_collision_geometry():
+    """Nothing may collide with anything, in either layout.
+
+    This is what makes it safe to overlay the arms' arcs: they pass straight through
+    each other, and a collision shape here would drive the solver into a deep
+    interpenetration the moment two models disagreed.
+    """
+    arms = [arm_for("m1"), arm_for("m5")]
+
+    for overlay in (False, True):
+        robot = ET.fromstring(build_urdf(MASS, ARM_MASS, LENGTH, arms, overlay=overlay))
+        assert robot.findall(".//collision") == [], f"overlay={overlay}"
+        # Sanity: the tree really was parsed, so the assertion above means something.
+        assert len(robot.findall("link")) == len(arms) + 1
 
 
 # ----------------------------------------------------------------------

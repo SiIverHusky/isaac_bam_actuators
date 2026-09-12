@@ -164,6 +164,14 @@ parser.add_argument(
     action="store_true",
     help="After reporting, keep replaying the sequence so the motion stays on screen.",
 )
+parser.add_argument(
+    "--overlay",
+    action="store_true",
+    help="Put every pendulum on the same pivot instead of spreading them out, so their "
+    "arcs coincide and only the model can pull them apart. The arms are separated "
+    "along their own rotation axis, which does not change the dynamics, and the rig "
+    "carries no collision geometry, so overlapping the arcs is safe.",
+)
 parser.add_argument("--csv", type=str, default=None, help="Write the trajectories to this CSV.")
 parser.add_argument("--visual", action="store_true", help="Show the viewport (default: headless).")
 AppLauncher.add_app_launcher_args(parser)
@@ -293,6 +301,12 @@ def make_scene_cfg(urdf_path: str, actuators: dict[str, BamActuatorCfg], num_env
                 asset_path=urdf_path,
                 fix_base=True,
                 make_instanceable=False,
+                # The rig emits no collision geometry at all (see
+                # bam_actuators.testbench). Both of these are already the defaults, but
+                # state them: the arms must never collide with each other, or an
+                # overlaid run would drive the solver into a deep interpenetration.
+                self_collision=False,
+                collision_from_visuals=False,
                 # The importer keeps the URDF's `<inertial>` values - there is no
                 # recompute-from-geometry option - which is essential here, since they
                 # were derived to match BAM's testbench analytically. `link_density`
@@ -431,6 +445,11 @@ def main() -> int:
     for pendulum in pendulums:
         swatch = "".join(f"{int(round(255 * channel)):02x}" for channel in pendulum.colour)
         print(f"    {pendulum.label:<10} #{swatch}  params={pendulum.params_file}")
+    if len(pendulums) > 1:
+        print(
+            "[scene] layout    : "
+            + ("overlaid on one pivot (no collisions)" if args.overlay else "spread along X")
+        )
     if args.visual:
         print(f"[scene] playback  : speed={args.speed:g}x, rendering every "
               f"{render_interval} physics step(s)")
@@ -459,7 +478,7 @@ def main() -> int:
 
     # --- build the scene -------------------------------------------
     urdf = Path(tempfile.mkdtemp()) / "bam_pendulum.urdf"
-    urdf.write_text(build_urdf(mass, arm_mass, length, pendulums))
+    urdf.write_text(build_urdf(mass, arm_mass, length, pendulums, overlay=args.overlay))
 
     sim = SimulationContext(
         SimulationCfg(
@@ -470,17 +489,21 @@ def main() -> int:
         )
     )
     if args.visual:
-        # Frame the whole row. The arms all rotate about +Y, so looking along -Y shows
-        # every swing face-on; they are spread along X so they read as a row instead of
-        # hiding behind one another. Without this the default camera leaves arms a few
-        # tens of centimetres long as specks near the world origin.
-        span = max(
-            length, (len(pendulums) - 1) * pendulum_spacing(length) / 2.0 + length
-        )
-        sim.set_camera_view(
-            eye=[0.25 * span, -2.6 * span, 0.9 * span],
-            target=[0.0, 0.0, -0.5 * length],
-        )
+        # Frame the rig. The arms all rotate about +Y, so a camera looking along -Y shows
+        # every swing face-on. Without this, arms a few tens of centimetres long are
+        # specks near the world origin.
+        if args.overlay:
+            # The pivots coincide, so the extent is one arm's swing circle rather than a
+            # row. Yaw off the rotation axis, though: the arms are separated *along* it,
+            # and looking straight down it would hide all but the nearest one.
+            span = length
+            eye = [1.15 * span, -2.45 * span, 0.9 * span]
+        else:
+            span = max(
+                length, (len(pendulums) - 1) * pendulum_spacing(length) / 2.0 + length
+            )
+            eye = [0.25 * span, -2.6 * span, 0.9 * span]
+        sim.set_camera_view(eye=eye, target=[0.0, 0.0, -0.5 * length])
     scene = InteractiveScene(make_scene_cfg(str(urdf), actuator_cfgs))
     sim.reset()
 

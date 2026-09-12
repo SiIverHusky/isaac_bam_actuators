@@ -84,7 +84,7 @@ def arm_for(label: str, params_file: str | None = None) -> Arm:
 
 
 def pendulum_spacing(length: float) -> float:
-    """Distance between neighbouring pivots [m].
+    """Pivot pitch for the side-by-side layout [m].
 
     Each arm swings a full circle about its pivot, so two of them can come within
     ``2 * length`` of each other. A little more than that leaves a visible gap at every
@@ -93,7 +93,47 @@ def pendulum_spacing(length: float) -> float:
     return 2.4 * length
 
 
-def build_urdf(mass: float, arm_mass: float, length: float, arms: list[Arm]) -> str:
+#: Pivot pitch for the overlaid layout [m]. Two rod radii, so the visual cylinders sit
+#: side by side without interpenetrating.
+OVERLAY_PITCH = 2 * ROD_RADIUS
+
+
+def pivot_offset(
+    index: int, count: int, length: float, overlay: bool = False
+) -> tuple[float, float, float]:
+    """Where arm ``index`` of ``count`` pivots, in the ``base`` link's frame.
+
+    Two layouts:
+
+    * **side by side** (the default) - spread along X, the direction the arms swing
+      through, by :func:`pendulum_spacing`, so the arcs never overlap;
+    * **overlaid** - every arm pivots on the same point *in the swing plane* and is
+      separated only along **Y**, its own rotation axis.
+
+    The overlaid layout is the one to compare models with, and it is exact: rotating
+    about the Y line through ``(0, y, 0)`` is the same rotation as about the Y line
+    through the origin, so offsetting a revolute joint along its own axis changes
+    nothing. The COM keeps its X and Z, so the gravity torque is unchanged too. Every
+    arm therefore traces the *same* arc, and only the friction model can pull them
+    apart - which is exactly the thing being compared.
+
+    Overlapping the arcs is safe because the rig carries no collision geometry at all
+    (see :func:`build_urdf`).
+
+    :param index: Arm index, left to right.
+    :param count: Total number of arms.
+    :param length: Arm length [m].
+    :param overlay: Overlay the arms instead of spreading them.
+    """
+    centre = (count - 1) / 2.0
+    if overlay:
+        return (0.0, (index - centre) * OVERLAY_PITCH, 0.0)
+    return ((index - centre) * pendulum_spacing(length), 0.0, 0.0)
+
+
+def build_urdf(
+    mass: float, arm_mass: float, length: float, arms: list[Arm], overlay: bool = False
+) -> str:
     """A URDF whose rigid-body dynamics equal BAM's testbench.
 
     Derived quantities, with ``m = mass + arm_mass``:
@@ -109,18 +149,21 @@ def build_urdf(mass: float, arm_mass: float, length: float, arms: list[Arm]) -> 
 
     Everything lives on one link per arm on purpose: a separate tip link joined by a
     fixed joint would be merged by the importer, perturbing the inertia derived above.
-    There is no ``<collision>`` geometry either - nothing in this scene should contact
-    anything, and a shape here would be a chance for the scene to stop matching BAM's
-    contact-free single-axis model.
 
-    With more than one arm they share the ``base`` link and are spaced along X, which is
-    the direction they swing through, so their arcs never overlap. Each arm carries its
-    own ``<material>``, so the colour travels with the asset.
+    **There is no collision geometry, anywhere.** No ``<collision>`` elements are
+    emitted and :data:`Arm` carries none, so nothing in the rig can collide - neither
+    with the world nor with the other arms. That is what makes the arms safe to overlay
+    (``overlay=True``), where their arcs coincide exactly.
+
+    Layout is chosen by :func:`pivot_offset`. Each arm carries its own ``<material>``,
+    so the colour travels with the asset.
 
     :param mass: Tip mass [kg].
     :param arm_mass: Arm mass [kg].
     :param length: Arm length [m].
-    :param arms: The pendulums to emit, left to right along X.
+    :param arms: The pendulums to emit.
+    :param overlay: Coincide the pivots in the swing plane instead of spreading the arms
+        out. The inertials are identical either way - only the joint origins move.
     """
     total_mass = mass + arm_mass
     com_distance = (mass + arm_mass / 2.0) * length / total_mass
@@ -129,11 +172,7 @@ def build_urdf(mass: float, arm_mass: float, length: float, arms: list[Arm]) -> 
     # Isotropic: only Iyy matters for this 1-DOF swing, and it is exact.
     i = inertia_com
 
-    offset = (len(arms) - 1) / 2.0
-    spacing = pendulum_spacing(length)
-
     parts = ['<?xml version="1.0"?>', '<robot name="bam_pendulum">']
-
     for arm in arms:
         r, g, b = arm.colour
         parts.append(
@@ -144,12 +183,12 @@ def build_urdf(mass: float, arm_mass: float, length: float, arms: list[Arm]) -> 
     parts.append('  <link name="base"/>')
 
     for index, arm in enumerate(arms):
-        x = (index - offset) * spacing
+        x, y, _ = pivot_offset(index, len(arms), length, overlay)
         parts.append(
             f'  <joint name="{arm.joint_name}" type="continuous">\n'
             f'    <parent link="base"/>\n'
             f'    <child link="{arm.link_name}"/>\n'
-            f'    <origin xyz="{x:.12g} 0 0" rpy="0 0 0"/>\n'
+            f'    <origin xyz="{x:.12g} {y:.12g} 0" rpy="0 0 0"/>\n'
             f'    <axis xyz="0 1 0"/>\n'
             f'    <dynamics damping="0.0" friction="0.0"/>\n'
             f'  </joint>'
