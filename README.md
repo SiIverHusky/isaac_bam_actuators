@@ -103,7 +103,10 @@ BAM_ROOT=/path/to/BAM python -m pytest tests/ -q
 # 3. Check the Isaac Lab integration without building a scene.
 python scripts/check_isaac_actuator.py
 
-# 4. Only then wire the actuator into a task.
+# 4. Replay a recorded log through a pendulum that matches BAM's testbench.
+python scripts/pendulum_scene.py                      # headless
+python scripts/pendulum_scene.py --visual             # with a viewport
+python scripts/pendulum_scene.py --csv /tmp/traj.csv  # dump the trajectories
 ```
 
 **Step 2 matters more than it looks.** It verifies the friction maths, the control
@@ -118,14 +121,38 @@ the `@configclass` definitions, `ActuatorBase` construction, `class_type`
 resolution, the `ArticulationActions` contract, effort clipping and a stateful
 control law over a few steps.
 
-Three things to get right when you move to step 4:
+**Step 4** builds a single-joint pendulum whose rigid-body dynamics are
+*analytically* identical to `bam.testbench.Pendulum`, by deriving the URDF's
+`<inertial>` block rather than tuning geometry:
+
+```
+I_pivot = mass*L^2 + (arm_mass/3)*L^2                 # swing inertia about the pivot
+d       = (mass + arm_mass/2) * L / (mass + arm_mass) # COM distance
+I_com   = I_pivot - (mass + arm_mass) * d^2           # parallel-axis shift
+```
+
+With gravity `-9.80665`, that reproduces BAM's `compute_mass` and `compute_bias`
+exactly, so the only remaining difference from the offline harness is the
+integrator. The scene replays a log's `goal_position` and reports both:
+
+- **Isaac vs the offline harness** — the same model in PhysX vs in BAM's loop.
+  A gap here means the *scene* differs (timestep, inertia, armature).
+- **Isaac vs the recording** — the model against the physical servo. This is the
+  one that answers "does it react like it's supposed to".
+
+The script also shows the external-torque hook in action: it computes
+`(mass + arm_mass/2) * g * L * sin(q)` each step and pushes it in via
+`set_external_torque()`, which is what makes the load-dependent (`m3`–`m6`) terms
+do anything.
+
+Three things to get right when wiring the actuator into a task of your own:
 
 - `physics_dt` must equal your task's `env.sim.dt`. The actuator never receives a
   timestep from Isaac Lab, and a mismatch silently distorts dynamics.
 - Set `effort_limit` explicitly, or PhysX's USD joint limit does your clipping.
 - Start with `m1` or `m2`, not `m5`. Load-dependent models need
   `set_external_torque()`; until an env calls it those terms are inert.
-  `tests/offline_rollout.py` shows exactly how to feed it.
+  `scripts/pendulum_scene.py` and `tests/offline_rollout.py` both show how.
 
 
 ## Use
