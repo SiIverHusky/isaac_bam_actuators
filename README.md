@@ -3,6 +3,10 @@
 [BAM](https://github.com/Rhoban/bam) extended friction models (`m1`–`m6`) as an
 **Isaac Lab extension**, exposed as an *explicit* actuator.
 
+**Just want to run it?** [`USER_GUIDE.md`](USER_GUIDE.md) walks through the two scripts
+flag by flag, with a cookbook and a troubleshooting table. The rest of this file is about
+the extension itself.
+
 The repository is laid out the way Isaac Lab expects an external extension to be:
 
 ```
@@ -11,6 +15,7 @@ isaac_bam_actuators/
 │   └── extension.toml          # Isaac Sim extension manifest (required)
 ├── setup.py                    # reads extension.toml, pip-installable
 ├── pyproject.toml
+├── USER_GUIDE.md               # how to use the scripts
 ├── bam_actuators/              # the Python module named in extension.toml
 │   ├── __init__.py             # lazy public API
 │   ├── friction.py             # torch port of BAM's friction budget (m1–m6)
@@ -28,6 +33,9 @@ isaac_bam_actuators/
 │   └── actuators/
 │       ├── __init__.py
 │       └── bam_actuator.py     # BamActuator: motor + friction -> joint effort
+├── scripts/
+│   ├── check_isaac_actuator.py # smoke-check the Isaac-facing surface
+│   └── pendulum_scene.py       # the pendulum rig: trajectories, model comparison
 └── tests/
     ├── test_friction.py        # the m1–m6 maths
     ├── test_motors.py          # each control law vs BAM's actuator class
@@ -102,7 +110,7 @@ python -m pip install -e /path/to/isaac_bam_actuators
 #    before you debug anything about the scene.
 python -m pip install pytest
 BAM_ROOT=/path/to/BAM python -m pytest tests/ -q
-# -> 97 passed. Without BAM_ROOT, 71 pass and the 26 parity tests skip.
+# -> 102 passed. Without BAM_ROOT, 76 pass and the 26 parity tests skip.
 
 # 3. Check the Isaac Lab integration without building a scene.
 python scripts/check_isaac_actuator.py
@@ -220,7 +228,7 @@ python scripts/pendulum_scene.py --visual --models m1 m3 m5
 
 A bare variant name is expanded against `--motor`, so `--model1 m1` means
 `<motor>/m1.json`; a `motor/model` reference or a path also works. `--params` is
-ignored (with a note) once any `--model*` is given.
+ignored (with a note) once any of `--model1`/`--model2`/`--models` is given.
 
 Every model gets its own pendulum, colour-coded by variant — `m1` red, `m2`
 orange, `m3` yellow, `m4` green, `m5` blue, `m6` violet — and printed as a legend at

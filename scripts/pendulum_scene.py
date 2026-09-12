@@ -401,14 +401,17 @@ def main() -> int:
         log, recorded, q0, dq0 = None, None, args.initial_angle, 0.0
         provenance = f"BAM trajectory {args.command!r} ({trajectory.duration:g}s)"
 
-    # Which pendulums to show, and which model drives each. With no --model* flag
-    # there is exactly one, chosen by --params - the original behaviour.
+    # Which pendulums to show, and which model drives each. With none of the
+    # --model1/--model2/--models options there is exactly one, chosen by --params.
     requested = [value for value in (args.model1, args.model2) if value is not None]
     requested += [value for group in (args.models or []) for value in group.split(",")]
 
     if requested:
         if args.params is not None:
-            print(f"[scene] note: --params {args.params!r} ignored; --model* picks the models.")
+            print(
+                f"[scene] note: --params {args.params!r} ignored; the --model options "
+                "pick the models."
+            )
         pendulums: list[Arm] = []
         for value in requested:
             path = resolve_model_arg(value, args.motor)
