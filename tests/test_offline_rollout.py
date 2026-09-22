@@ -11,9 +11,11 @@ drives BAM's pendulum testbench from a recorded trajectory two ways:
   :class:`tests.offline_rollout.OfflineSimulator`
 
 Both sides get the same goal sequence, the same initial state and the same
-``dt``, so any divergence comes from our components. Two motors are covered:
+``dt``, so any divergence comes from our components. Three motors are covered:
 
-* ``md01`` - stateless control law with the firmware current limiter,
+* ``md01`` - stateless voltage P law with the firmware current limiter,
+* ``md01i`` with the bundled ``m3`` - stateless *current* law, run against a real
+  MD01 recording (``data_md01-6v2``), which is what the new campaign changed,
 * ``sts3215`` with the bundled ``m5`` - stateful slew-limited target plus
   load-dependent, directional friction (which needs the external torque, so this
   also exercises the ``external_torque`` path that Isaac Lab cannot test yet).
@@ -35,17 +37,26 @@ from offline_rollout import OfflineSimulator, drive, load_raw_log
 from bam_paths import bam_root
 
 BAM_ROOT = bam_root()
+
+#: The campaign-2 MD01 recordings the ``md01i`` fits were identified on (servo 6,
+#: 2026-09-21). Processed, so the entries carry the AT32 firmware constants too.
+MD01_LOG_DIR = BAM_ROOT / "data_md01-6v2"
+MD01_LOG_NAME = "2026-09-21_18h22m26.json"
+
+#: The Feetech recording the STS3215 case was written against (``steps`` at kp=8, so
+#: the step commands exercise the slew limiter). BAM's bundled Feetech logs in
+#: ``data_raw/raw/`` predate the ``arm_mass`` metadata ``Pendulum`` now needs, so the
+#: case skips when this one is absent rather than falling back to a mismatched rig.
 LOG_DIR = BAM_ROOT / "data_raw"
-#: A "steps" trajectory at kp=8: step commands exercise a stateful slew limiter.
 LOG_NAME = "2026-09-10_15h22m23.json"
 
 N_STEPS = 400
 
 
-def _bam():
+def _bam(log_dir: Path = LOG_DIR):
     """Import BAM from source, or skip."""
-    if not LOG_DIR.is_dir():
-        pytest.skip(f"recorded logs not found at {LOG_DIR}")
+    if not log_dir.is_dir():
+        pytest.skip(f"recorded logs not found at {log_dir}")
     if str(BAM_ROOT) not in sys.path:
         sys.path.insert(0, str(BAM_ROOT))
     try:
@@ -86,7 +97,9 @@ class BamSide:
 
 def _load(log_path: Path):
     """The recorded log plus the per-step goal sequence both sides will follow."""
-    _bam()
+    _bam(log_path.parent)
+    if not log_path.is_file():
+        pytest.skip(f"recording not found at {log_path}")
     log = load_raw_log(str(log_path))
     entries = log["entries"][:N_STEPS]
     goals = [entry["goal_position"] for entry in entries]
@@ -137,15 +150,16 @@ def _run_pair(log, entries, goals, bam_model, our_motor, our_friction):
 
 @pytest.fixture
 def md01_pair():
-    _bam()
+    _bam(MD01_LOG_DIR)
     from bam.actuators import actuators
     from bam.model import models
 
-    log, entries, goals = _load(LOG_DIR / LOG_NAME)
+    log, entries, goals = _load(MD01_LOG_DIR / MD01_LOG_NAME)
 
-    # No identified params file exists for MD01 in BAM, so seed the motor values
+    # The voltage-law MD01 has no bundled fits, so seed the identified values
     # identically on both sides - this is a test of our composition, not of physics.
-    motor_params = {"kt": 0.5, "R": 1.0, "armature": 1e-4}
+    # The values are the ones BAM's MD01Actuator.initialize() creates.
+    motor_params = {"kt": 0.5, "R": 10.0, "armature": 3e-4}
 
     bam_model = models["m5"]()
     bam_model.set_actuator(actuators["md01"]())
@@ -177,8 +191,8 @@ def test_md01_run_is_not_degenerate(md01_pair):
     """Guard against a vacuous comparison: the pendulum must actually move.
 
     Note the PWM clamp is never reached here - the firmware current limiter bites
-    first (``max_current=1.4`` bounds the duty cycle to roughly +/-0.12 duty at
-    rest), which is exactly the behaviour being ported.
+    first (``max_current=0.45`` bounds the duty cycle to roughly +/-0.375 duty at
+    rest with R=10), which is exactly the behaviour being ported.
     """
     ours, _ = md01_pair
     diagnostics = ours["diagnostics"]
@@ -187,13 +201,83 @@ def test_md01_run_is_not_degenerate(md01_pair):
     assert np.ptp(ours["controls"]) > 1e-3, "the control should vary"
     assert np.ptp(diagnostics["frictionloss"]) > 1e-6, "friction budget should vary"
 
-    duty = ours["controls"] / 12.0  # log vin
-    window = 1.0 * 1.4 / 12.0  # R * max_current / vin at rest
-    assert np.all(np.abs(duty) <= window + 1e-6), "duty must stay inside the current window"
+    # Load-dependent friction needs the external torque, and an MD01 recording
+    # carries the rig (mass / arm_mass / length) and the firmware the servo was
+    # driven with, so nothing here is hard-coded beyond the absent fits.
+    motor = get_motor("md01")()
+    duty = ours["controls"] / motor.vin
+    # The firmware bounds the duty cycle to the window that holds |I| <= max_current,
+    # which the back-EMF shifts with velocity:
+    #   (kt*dq - R*max_current)/vin <= duty <= (kt*dq + R*max_current)/vin
+    center = motor.kt * ours["velocities"] / motor.vin
+    span = motor.R * motor.max_current / motor.vin
+    assert np.all(np.abs(duty - center) <= span + 1e-6), "duty must stay inside the current window"
 
 
 # ----------------------------------------------------------------------
-# Case B: STS3215 with the bundled m5 - stateful slew limiter, load-dependent
+# Case B: md01i with the bundled m3 on a real MD01 recording - the new campaign
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def md01i_pair():
+    _bam(MD01_LOG_DIR)
+    from bam.model import load_model
+
+    log, entries, goals = _load(MD01_LOG_DIR / MD01_LOG_NAME)
+    params_path = resolve_params_file("md01i/m3")
+
+    # The file is self-describing - actuator, friction maths and motor values - so
+    # there is nothing to seed by hand.
+    bam_model = load_model(params_path)
+
+    our_motor = get_motor("md01i")()
+    our_motor.set_params(json.loads(Path(params_path).read_text()))
+    our_friction = BamFrictionModel.from_json(params_path)
+
+    ours, reference = _run_pair(log, entries, goals, bam_model, our_motor, our_friction)
+    return ours, reference
+
+
+def test_md01i_m3_trajectory_matches_bam_on_a_real_md01_log(md01i_pair):
+    ours, reference = md01i_pair
+
+    np.testing.assert_allclose(ours["positions"], reference["positions"], rtol=0, atol=1e-9)
+    np.testing.assert_allclose(ours["velocities"], reference["velocities"], rtol=0, atol=1e-9)
+
+
+def test_md01i_m3_control_signal_matches_bam_step_by_step(md01i_pair):
+    """The control signal is a *current* here, so this also pins the unit."""
+    ours, reference = md01i_pair
+
+    np.testing.assert_allclose(ours["controls"], reference["controls"], rtol=1e-12, atol=1e-15)
+
+
+def test_md01i_m3_current_stays_within_the_fitted_limit(md01i_pair):
+    """A real recording must not push the model past its identified current cap."""
+    ours, _ = md01i_pair
+
+    motor = get_motor("md01i")()
+    motor.set_params(json.loads(Path(resolve_params_file("md01i/m3")).read_text()))
+
+    assert np.ptp(ours["positions"]) > 1e-3, "the pendulum should move"
+    assert np.abs(ours["controls"]).max() <= motor.current_limit + 1e-12
+
+
+def test_md01i_m3_run_is_not_degenerate(md01i_pair):
+    """m3 is load-dependent, so the budget has to track the external torque."""
+    ours, _ = md01i_pair
+    diagnostics = ours["diagnostics"]
+
+    assert np.ptp(diagnostics["frictionloss"]) > 1e-6, "friction budget should vary"
+    gearbox = np.abs(diagnostics["bias_torque"] - diagnostics["motor_torque"])
+    assert np.ptp(gearbox) > 1e-3, "the gearbox torque should vary"
+    correlated = np.corrcoef(gearbox, diagnostics["frictionloss"])[0, 1]
+    assert correlated > 0.5, f"friction budget does not track the load (r={correlated:.3f})"
+
+
+# ----------------------------------------------------------------------
+# Case C: STS3215 with the bundled m5 - stateful slew limiter, load-dependent
 # directional friction (exercises external_torque)
 # ----------------------------------------------------------------------
 

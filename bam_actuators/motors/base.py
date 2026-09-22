@@ -17,6 +17,7 @@ The friction budget is deliberately *not* here: it belongs to
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
@@ -31,6 +32,16 @@ def _clamp(value: ArrayLike, low: ArrayLike, high: ArrayLike) -> ArrayLike:
     if isinstance(value, torch.Tensor):
         return torch.clamp(value, low, high)
     return min(max(value, low), high)
+
+
+def _sign(value: ArrayLike) -> ArrayLike:
+    """``sign`` that works for both torch tensors and Python floats.
+
+    Matches ``torch.sign`` / ``numpy.sign``: ``sign(0) == 0``, and a NaN gives NaN.
+    """
+    if isinstance(value, torch.Tensor):
+        return torch.sign(value)
+    return 0.0 if value == 0.0 else math.copysign(1.0, value)
 
 
 class MotorBase:
@@ -54,7 +65,9 @@ class MotorBase:
     #: :meth:`reset` / :meth:`get_state` / :meth:`set_state`.
     stateful: ClassVar[bool] = False
 
-    #: Physical unit of the control signal returned by :meth:`control`.
+    #: Physical unit of the control signal returned by :meth:`control`. Also selects
+    #: the torque equation in :meth:`torque`: ``"volts"`` uses the DC motor equation
+    #: with back-EMF, ``"amps"`` is a current command (``tau = kt * I``).
     control_unit: ClassVar[str] = "volts"
 
     #: Firmware constants, overridable per instance.
@@ -105,19 +118,32 @@ class MotorBase:
     # ------------------------------------------------------------------
 
     def torque(self, control: ArrayLike | None, torque_enable: bool, q: ArrayLike, dq: ArrayLike) -> ArrayLike:
-        r"""Motor torque from the control signal, including back-EMF.
+        r"""Motor torque from the control signal.
+
+        For a **voltage**-controlled servo (:attr:`control_unit` ``"volts"``) the
+        shared DC motor equation applies, including back-EMF:
 
         .. math:: \tau = k_t V / R - k_t^2 \dot{q} / R
 
-        Shared by every voltage-controlled servo, mirroring BAM's
-        ``DCMotorActuator``. Current-controlled motors would override this.
+        For a **current**-controlled servo (:attr:`control_unit` ``"amps"``) the
+        signal already *is* the current the inner loop holds, so the torque is
 
-        :param control: Control signal from :meth:`control` (volts).
+        .. math:: \tau = k_t I
+
+        with the back-EMF accounted for inside :meth:`control` (that is what the
+        firmware's duty-cycle clamp does). Mirrors BAM, where
+        ``VoltageControlledActuator`` and ``CurrentControlledActuator`` each define
+        their own ``compute_torque``.
+
+        :param control: Control signal from :meth:`control`, in :attr:`control_unit`.
         :param torque_enable: Whether the servo is powered; ``False`` gives zero torque.
         :param q: Joint position [rad] (unused here).
         :param dq: Joint velocity [rad/s].
         :returns: Motor torque [Nm].
         """
+        if self.control_unit == "amps":
+            return self.kt * control * torque_enable
+
         volts = control
         tau = self.kt * volts / self.R - (self.kt**2) * dq / self.R
         return tau * torque_enable
@@ -165,7 +191,27 @@ class MotorBase:
 
     def _volts(self, duty: ArrayLike) -> ArrayLike:
         """Apply the physical PWM limit (battery voltage) and scale to volts."""
-        return self.vin * _clamp(duty, -self.max_pwm, self.max_pwm)
+        self.duty_cycle = _clamp(duty, -self.max_pwm, self.max_pwm)
+        return self.vin * self.duty_cycle
+
+    def _current_from_duty(self, current: ArrayLike, dq: ArrayLike) -> ArrayLike:
+        """Feed a current setpoint through the H-bridge, returning the current reached.
+
+        Mirrors the tail of BAM's ``CurrentControlledActuator.compute_control``:
+        the duty cycle that would produce ``current`` given the back-EMF is
+        ``(R * I + kt * dq) / vin``; that duty is clamped to ``[-max_pwm, max_pwm]``
+        and the current recomputed from it. At high speed the clamp bites and the
+        servo delivers less current than asked for - exactly what the firmware does
+        when the battery cannot supply the voltage.
+
+        :param current: Desired motor current [A], already clipped to the cap.
+        :param dq: Joint velocity [rad/s] (back-EMF).
+        :returns: The current actually delivered [A].
+        """
+        duty_cycle = (self.R * current + self.kt * dq) / self.vin
+        duty_cycle = _clamp(duty_cycle, -self.max_pwm, self.max_pwm)
+        self.duty_cycle = duty_cycle
+        return (duty_cycle * self.vin - self.kt * dq) / self.R
 
     # ------------------------------------------------------------------
     # State (for stateful control laws)

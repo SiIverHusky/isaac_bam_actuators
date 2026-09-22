@@ -12,6 +12,10 @@ tests cannot reach:
 * the ``ArticulationActions`` contract, and
 * ``compute()`` returning finite efforts of the right shape.
 
+One case per control-law family: the voltage law (``md01``), the current law with a
+bundled identified model (``md01i/m3``), the measured AT32 loops (``md01c``) and the
+stateful STS3215 (``sts3215/m5``).
+
 Run it before wiring the actuator into a task: if this passes, anything that then
 goes wrong is about the scene, not about the extension.
 
@@ -50,10 +54,16 @@ NUM_ENVS = 2
 
 
 def base_cfg(**overrides) -> BamActuatorCfg:
-    """A minimal actuator config: one joint group, modest limits."""
+    """A minimal actuator config: one joint group, deliberately tight limits.
+
+    ``effort_limit`` is small on purpose. Every case has to exceed it under the huge
+    command below, or the clipping check is vacuous - and the lowest of them (the
+    voltage-law ``md01``, whose duty cycle is capped by its current limit) lands at
+    about 0.175 Nm.
+    """
     defaults = dict(
         joint_names_expr=[".*"],
-        effort_limit=5.0,
+        effort_limit=0.15,
         velocity_limit=30.0,
         physics_dt=DT,
         # All friction lives in the actuator model, so the solver must add none of
@@ -125,14 +135,21 @@ def check(label: str, cfg: BamActuatorCfg) -> None:
 
 
 def main() -> int:
-    # 1. A motor with no identified params file. MD01 seeds kt at 0.0, so it needs
-    #    motor_params to produce torque at all.
-    check(
-        "md01 (motor_params seeds kt)",
-        base_cfg(motor="md01", motor_params={"kt": 0.5, "R": 1.0, "armature": 1e-4}),
-    )
+    # 1. The voltage law with no params file at all: the module's own seeds are the
+    #    model, exactly as BAM's MD01Actuator.initialize() seeds it.
+    check("md01 (voltage law, module defaults)", base_cfg(motor="md01"))
 
-    # 2. A bundled identified model: the file decides the motor AND the friction maths.
+    # 2. The current law with a bundled identified model. The file decides the motor
+    #    ("actuator": "md01i"), the friction maths ("model": "m3") and every
+    #    identified value - including the current limit, which no cfg field carries.
+    check("md01i/m3 (bundled params file)", base_cfg(params_file="md01i/m3"))
+
+    # 3. The measured AT32 loops, whose firmware constants (kp_current, kff_current,
+    #    cap_ma) are module defaults rather than params-file values.
+    check("md01c (loop law, module defaults)", base_cfg(motor="md01c"))
+
+    # 4. A stateful control law: the STS3215's slew limiter is only exercised if the
+    #    same actuator instance is stepped more than once.
     check("sts3215/m5 (bundled params file)", base_cfg(params_file="sts3215/m5"))
 
     print("\nOK: BamActuator works inside Isaac Lab.")

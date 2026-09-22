@@ -100,14 +100,15 @@ parser.add_argument(
     default=None,
     help="Number of steps to simulate. Default: the whole trajectory, or the whole recording.",
 )
-parser.add_argument("--motor", type=str, default="sts3215", help="Motor name as BAM's params files write it, e.g. 'sts3215' or 'md01' - not the "
-    "module filename. The params file's 'actuator' key overrides this. See --list-motors.")
+parser.add_argument("--motor", type=str, default="sts3215", help="Motor name as BAM's params files write it, e.g. 'sts3215', 'md01' (voltage law), "
+    "'md01i' (current law), 'md01c' (measured AT32 loops) - not the module filename. "
+    "The params file's 'actuator' key overrides this. See --list-motors.")
 parser.add_argument(
     "--params",
     type=str,
     default=None,
-    help="Params file for the single-pendulum case, or 'none'. Default: sts3215/m5. "
-    "Ignored when --model1/--model2/--models are given.",
+    help="Params file for the single-pendulum case, or 'none'. Default: sts3215/m5; try "
+    "md01i/m3 for the new MD01 campaign. Ignored when --model1/--model2/--models are given.",
 )
 parser.add_argument("--list-motors", action="store_true", help="List valid --motor values and exit.")
 # Which models to show. One pendulum each, so they can be compared side by side.
@@ -233,14 +234,22 @@ def default_log() -> Path:
     return BAM_ROOT / "data_raw" / "2026-09-10_15h22m23.json"
 
 
-def firmware_overrides(log: dict | None, motor: str) -> dict:
+#: Firmware constants a motor module declares that ``BamActuatorCfg`` has no field
+#: for, so they have to travel through ``motor_params``. ``md01c`` is the only one
+#: today: its loop gains come from the AT32 flash, and an MD01 recording writes them
+#: into the log, so they have to reach the actuator somehow.
+MOTOR_PARAM_FIRMWARE = ("kp_current", "kff_current", "cap_ma")
+
+
+def firmware_overrides(log: dict | None, motor: str) -> tuple[dict, dict]:
     """Firmware constants to configure the actuator with.
 
     Firmware is **not** in params files, so it comes from the recording. Which
     fields a recording supplies is motor-specific - ``DCMotorActuator.load_log``
     sets ``kp`` and ``vin``, ``MD01Actuator`` also takes ``error_gain`` and
-    ``max_pwm``, ``STS3215Actuator`` overrides nothing - so ask BAM rather than
-    hard-coding the rule.
+    ``max_pwm``, ``MD01LoopActuator`` also takes the AT32 loop gains,
+    ``STS3215Actuator`` overrides nothing - so ask BAM rather than hard-coding the
+    rule.
 
     With no recording there is nothing to mirror, so return nothing and let the
     motor module's own defaults stand. Both sides of the comparison then use those
@@ -248,25 +257,32 @@ def firmware_overrides(log: dict | None, motor: str) -> dict:
 
     :param log: The recorded log, or ``None`` for a synthetic run.
     :param motor: Motor name, as BAM's ``actuators`` registry writes it.
+    :returns: ``(firmware_fields, motor_params)`` - the first for the named cfg
+        fields, the second for the constants that have no field of their own (and
+        so are empty for every motor but ``md01c``).
     """
     if log is None:
-        return {}
+        return {}, {}
 
     try:
         from bam.actuators import actuators
 
         reference = actuators[motor]()
         reference.load_log(log)
-        return {
+        firmware = {
             "vin": reference.vin,
             "firmware_kp": reference.kp,
             "error_gain": reference.error_gain,
             "max_pwm": reference.max_pwm,
         }
+        motor_params = {
+            name: getattr(reference, name) for name in MOTOR_PARAM_FIRMWARE if hasattr(reference, name)
+        }
+        return firmware, motor_params
     except Exception as exc:  # noqa: BLE001 - fall back, but say so
         print(f"[scene] BAM not usable for firmware ({exc}); using kp/vin from the log.")
         print("[scene] WARNING: a motor that also takes error_gain/max_pwm from the log will differ.")
-        return {"vin": log["vin"], "firmware_kp": log["kp"]}
+        return {"vin": log["vin"], "firmware_kp": log["kp"]}, {}
 
 
 def make_scene_cfg(urdf_path: str, actuators: dict[str, BamActuatorCfg], num_envs: int = 1):
@@ -431,7 +447,7 @@ def main() -> int:
             resolved = resolve_params_file(params_arg)
             pendulums = [arm_for(Path(resolved).stem, resolved)]
 
-    firmware = firmware_overrides(log, args.motor)
+    firmware, loop_firmware = firmware_overrides(log, args.motor)
 
     # Rendering is decimated to roughly 60 frames per second of wall-clock time: at
     # dt = 5 ms that is one frame every few physics steps. Scaling it with --speed
@@ -444,6 +460,8 @@ def main() -> int:
     print(f"[scene] motor     : {args.motor}")
     print("[scene] firmware  : " + (" ".join(f"{k}={v:g}" for k, v in firmware.items())
                                      or "(motor module defaults)"))
+    if loop_firmware:
+        print("[scene] loop gains: " + " ".join(f"{k}={v:g}" for k, v in loop_firmware.items()))
     print(f"[scene] pendulums : {len(pendulums)}")
     for pendulum in pendulums:
         swatch = "".join(f"{int(round(255 * channel)):02x}" for channel in pendulum.colour)
@@ -474,6 +492,7 @@ def main() -> int:
             friction=0.0,
             dynamic_friction=0.0,
             viscous_friction=0.0,
+            motor_params=loop_firmware,
             **firmware,
         )
         for pendulum in pendulums
@@ -611,16 +630,12 @@ def main() -> int:
     for pendulum in pendulums:
         live = actuators[pendulum.slug]
         # Use the motor the actuator actually resolved - a params file can override
-        # --motor - so both sides are guaranteed to run the same control law.
+        # --motor - so both sides are guaranteed to run the same control law, and
+        # copy *every* parameter rather than a hand-picked list: the current laws
+        # have values (current_limit, error_gain_ratio, V0, kp_ratio, the md01c loop
+        # gains) that a kp/vin/error_gain/max_pwm list would silently drop.
         motor = get_motor(live.motor_name)()
-        motor.set_params(
-            {
-                "kp": live.motor.kp,
-                "vin": live.motor.vin,
-                "error_gain": live.motor.error_gain,
-                "max_pwm": live.motor.max_pwm,
-            }
-        )
+        motor.set_params(live.motor.get_params())
         friction = BamFrictionModel.from_params({}, model=None)
         if pendulum.params_file:
             motor.set_params(json.loads(Path(pendulum.params_file).read_text()))

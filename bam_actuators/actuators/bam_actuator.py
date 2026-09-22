@@ -254,16 +254,21 @@ class BamActuator(ActuatorBase):
         overrides: dict = dict(data or {})
 
         # Free-form overrides for identified values (kt, R, armature, q_offset,
-        # max_velocity, error_gain_ratio, ...). Needed in particular for a motor
-        # whose values are not identified yet - e.g. MD01 seeds kt at 0.0, so
-        # without this there is no way to give it a torque constant.
+        # max_velocity, error_gain_ratio, V0, ...). Needed in particular for a motor
+        # whose values are not identified yet, or to seed one from a datasheet before
+        # a fit exists. The named firmware fields below take precedence over this.
         overrides.update({key: value for key, value in self.cfg.motor_params.items() if value is not None})
 
         for cfg_field, motor_name in (
             ("vin", "vin"),
             ("error_gain", "error_gain"),
             ("max_pwm", "max_pwm"),
+            # Voltage-controlled servos cap the *duty cycle* to hold the current
+            # (``md01``); current-controlled ones cap the current setpoint itself
+            # (``md01i``). The field is one; the motor module decides which name it
+            # knows, and ``set_params`` ignores the other.
             ("max_current", "max_current"),
+            ("max_current", "current_limit"),
             ("firmware_kp", "kp"),
         ):
             value = getattr(self.cfg, cfg_field)
@@ -426,9 +431,9 @@ class BamActuatorCfg(ActuatorBaseCfg):
 
     # --- which control law ---
     motor: str | None = None
-    """Name of the motor module to use, e.g. ``"sts3215"`` or ``"md01"``. Taken
-    from the params file's ``"actuator"`` key when the file provides one, then
-    falling back to ``"generic"``. See
+    """Name of the motor module to use: ``"sts3215"``, ``"md01"``, ``"md01i"``,
+    ``"md01c"``, ... Taken from the params file's ``"actuator"`` key when the file
+    provides one, then falling back to ``"generic"``. See
     :func:`bam_actuators.motors.available_motors`."""
 
     # --- identified model ---
@@ -447,9 +452,11 @@ class BamActuatorCfg(ActuatorBaseCfg):
     """Overrides for identified motor values, applied on top of :attr:`params_file`.
 
     Anything the motor module declares: ``kt``, ``R``, ``armature``, ``q_offset``,
-    ``max_velocity``, ``error_gain_ratio``, ... Useful to seed a value that is not
-    identified yet - MD01's ``kt`` defaults to ``0.0``, so it needs one to produce
-    any torque. The named firmware fields below take precedence over this.
+    ``max_velocity``, ``error_gain_ratio``, ``current_limit``, ``V0``, ... This is
+    how an unfitted motor is given a value it cannot work without, and how a
+    firmware constant with no dedicated field (``md01c``'s ``kp_current``,
+    ``kff_current``, ``cap_ma``) is set. The named firmware fields below take
+    precedence over this.
     """
 
     # --- firmware overrides (None -> the motor module's default) ---
@@ -466,8 +473,10 @@ class BamActuatorCfg(ActuatorBaseCfg):
     """Maximum duty-cycle magnitude."""
 
     max_current: float | None = None
-    """Firmware current limit [A]. ``None`` means "use the motor's default";
-    pass ``float("inf")`` to disable the limiter."""
+    """Firmware current limit [A]. A voltage-controlled servo (``md01``,
+    ``sts3215``) applies it to the duty cycle; a current-controlled one (``md01i``,
+    ``md01c``) applies it to the current setpoint. ``None`` means "use the motor's
+    default"; pass ``float("inf")`` to disable the limiter."""
 
     # --- PD gains, relaxed: the firmware law owns its own gains ---
     stiffness: float | None = None

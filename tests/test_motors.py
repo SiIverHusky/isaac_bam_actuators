@@ -25,9 +25,14 @@ from bam_paths import bam_root
 BAM_ROOT = bam_root()
 
 #: Motors we have a BAM counterpart for, and a bundled params file to drive them.
+#: ``md01i`` appears twice because the params file carries the fitted current limit
+#: and gain ratio, so two variants exercise two very different control ranges.
 PARITY_CASES = [
     ("sts3215", "sts3215/m5"),
     ("md01", None),
+    ("md01i", "md01i/m3"),
+    ("md01i", "md01i/m6"),
+    ("md01c", None),
 ]
 
 DT = 0.02
@@ -77,7 +82,7 @@ def _our_motor(motor: str, params: str | None):
 
 
 def test_registry_contains_the_ported_motors():
-    assert set(available_motors()) >= {"generic", "sts3215", "md01"}
+    assert set(available_motors()) >= {"generic", "sts3215", "md01", "md01i", "md01c"}
 
 
 def test_unknown_motor_raises_with_guidance():
@@ -92,7 +97,7 @@ def test_unknown_motor_raises_with_guidance():
 
 @pytest.mark.parametrize("motor, params", PARITY_CASES)
 def test_firmware_constants_match_bam(motor, params):
-    """vin / kp / error_gain / max_pwm / max_current / stateful must be identical."""
+    """vin / kp / error_gain / max_pwm / current cap / stateful must be identical."""
     _bam_imports()
     reference = _bam_model(motor, params).actuator
     ours = _our_motor(motor, params)
@@ -102,11 +107,63 @@ def test_firmware_constants_match_bam(motor, params):
     assert ours.error_gain == pytest.approx(reference.error_gain)
     assert ours.max_pwm == pytest.approx(reference.max_pwm)
     assert ours.stateful == type(reference).stateful
+    # The unit is what BAM uses to pick the torque equation, so it has to agree too.
+    assert ours.control_unit == reference.control_unit()
 
-    if reference.max_current is None:
-        assert ours.max_current is None
+    # The current cap lives on the actuator for the voltage law and on the model
+    # (named current_limit) for the current laws, so BAM's classes do not all have
+    # a max_current attribute.
+    if getattr(reference, "max_current", None) is None:
+        assert getattr(ours, "max_current", None) is None
     else:
         assert ours.max_current == pytest.approx(reference.max_current)
+
+
+def test_md01_family_seeds_match_bams_initialize():
+    """An unfitted MD01 must start from the same numbers as BAM's ``initialize()``.
+
+    Without a params file these seeds *are* the model, so a drift here would show
+    up as a plausible-looking but wrong rollout rather than as an error.
+    """
+    _bam_imports()
+    from bam.actuators import actuators
+    from bam.model import models
+
+    for motor in ("md01", "md01i", "md01c"):
+        bam_model = models["m5"]()
+        bam_model.set_actuator(actuators[motor]())
+        ours = get_motor(motor)()
+
+        for name in ours.parameters:
+            parameter = getattr(bam_model, name, None)
+            if parameter is None:
+                continue
+            assert getattr(ours, name) == pytest.approx(parameter.value), f"{motor}.{name}"
+
+        # ...and the firmware the params files never carry.
+        for name in ("kp_current", "kff_current", "cap_ma"):
+            if hasattr(ours, name):
+                assert getattr(ours, name) == pytest.approx(getattr(bam_model.actuator, name)), f"{motor}.{name}"
+
+
+def test_md01c_loop_firmware_matches_the_measured_values():
+    """The md01c loop gains are measured flash values, so pin them literally."""
+    motor = get_motor("md01c")()
+
+    assert motor.vin == 12.0
+    assert motor.cap_ma == 1500.0
+    assert motor.max_pwm == pytest.approx(0.99)
+    assert motor.kp_current == pytest.approx(6e-4)
+    assert motor.kff_current == pytest.approx(3e-4)
+
+    _bam_imports()
+    from bam.actuators import actuators
+    from bam.model import models
+
+    bam_model = models["m5"]()
+    bam_model.set_actuator(actuators["md01c"]())
+    for name in ("kp_current", "kff_current", "max_pwm", "cap_ma"):
+        assert getattr(motor, name) == pytest.approx(getattr(bam_model.actuator, name))
 
 
 # ----------------------------------------------------------------------
@@ -206,6 +263,49 @@ def test_md01_current_limiter_bounds_the_duty_cycle():
     span = motor.R * motor.max_current / motor.vin
 
     assert volts <= motor.vin * min(span, motor.max_pwm) + 1e-12
+
+
+def test_md01i_bounds_the_current_command():
+    """md01i is the inverse: the *current setpoint* is what gets capped.
+
+    The cap is the fitted ``current_limit``, and it has to bind on the command
+    itself - not merely somewhere downstream of the duty cycle - because that is
+    the saturation the fit was identified with.
+    """
+    motor = _our_motor("md01i", "md01i/m3")
+
+    current = float(motor.control(100.0, 0.0, 0.0, DT))
+    assert abs(current) <= motor.current_limit + 1e-12
+    # The fitted limit is the binding one: the H-bridge is not the constraint at rest.
+    assert abs(current) == pytest.approx(motor.current_limit, rel=1e-12)
+
+    # A demanding command with the ratio folded in must not escape either.
+    assert abs(float(motor.control(100.0, 0.0, 5.0, DT))) <= motor.current_limit + 1e-12
+
+
+def test_md01i_torque_ceiling_is_the_physical_quantity():
+    """``kt`` is a gauge in the md01i law; ``kt * current_limit`` is not.
+
+    BAM's README reports 0.43-0.46 Nm for m1/m3/m5/m6, so a fit whose ceiling
+    drifts out of that band means the params file was not identified on this bench.
+    """
+    for model in ("m1", "m3", "m5", "m6"):
+        motor = _our_motor("md01i", f"md01i/{model}")
+        assert 0.40 <= motor.torque_limit <= 0.50, f"md01i/{model}: {motor.torque_limit}"
+
+
+def test_md01i_scales_the_error_into_amps():
+    """The law is a P law in amps: the setpoint is linear in the error."""
+    motor = get_motor("md01i")()
+    motor.set_params({"error_gain_ratio": 1.0, "current_limit": 100.0, "R": 1.0, "kt": 0.5})
+
+    at_rest = float(motor.control(0.1, 0.0, 0.0, DT))
+    assert at_rest == pytest.approx(0.1 * motor.kp * motor.error_gain)
+    assert float(motor.control(-0.1, 0.0, 0.0, DT)) == pytest.approx(-at_rest)
+
+    # Doubling the ratio doubles the current - that is what makes it a gauge.
+    motor.set_params({"error_gain_ratio": 2.0})
+    assert float(motor.control(0.1, 0.0, 0.0, DT)) == pytest.approx(2.0 * at_rest)
 
 
 # ----------------------------------------------------------------------

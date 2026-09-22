@@ -4,11 +4,18 @@
 """Locating the identified parameter files bundled with the extension.
 
 Identified models are copied into ``bam_actuators/params/<motor>/<model>.json`` so
-they travel with the extension. A config can then point at one by name::
+they travel with the extension, where ``<motor>`` is the **actuator name** the
+params file itself carries in its ``"actuator"`` key. A config can then point at
+one by name::
 
     BamActuatorCfg(params_file="sts3215/m5")
+    BamActuatorCfg(params_file="md01i/m3")     # the MD01 current-law fits
 
-which resolves to the bundled file for that motor and BAM model variant.
+which resolves to the bundled file for that motor and BAM model variant. Note the
+directory follows the actuator, not the product: the campaign-2 MD01 fits live in
+``bam/params/md01-3/`` in BAM but are ``md01i`` models, and MD01 now has three
+actuators (``md01`` voltage, ``md01i`` current, ``md01c`` loops) that would
+otherwise collide on one directory name.
 """
 
 from __future__ import annotations

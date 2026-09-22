@@ -17,9 +17,13 @@ The offline test suite is the exception: it is pure torch, so it runs anywhere, 
 without a GPU.
 
 ```bash
-BAM_ROOT=/path/to/BAM python -m pytest tests/ -q    # 102 passed
-python -m pytest tests/ -q                          # 76 passed, 26 skipped
+BAM_ROOT=/path/to/BAM python -m pytest tests/ -q    # 135 passed, 4 skipped
+python -m pytest tests/ -q                          # 92 passed, 47 skipped
 ```
+
+The skips are always missing *data*, never missing code: without a BAM checkout the
+parity tests skip, and with one the four STS3215 rollout cases skip if their Feetech
+recording is absent. See [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -57,39 +61,58 @@ Exit code `0` on success, `1` on the first failure (with a full traceback).
 ### What it prints
 
 ```
---- md01 (motor_params seeds kt) ---
+--- md01 (voltage law, module defaults) ---
 <BamActuator ...>                                  <- ActuatorBase.__str__
   motor=md01  friction model=None terms=[]
-    step: applied_effort=+0.123456 Nm (computed=+0.123456)
-    step: applied_effort=+0.456789 Nm (computed=+0.456789)
-    step: applied_effort=+0.567890 Nm (computed=+0.567890)
-  effort_limit respected (peak 5.000000 <= 5.0)
+    step: applied_effort=+0.049840 Nm (computed=+0.099840)
+    step: applied_effort=+0.049840 Nm (computed=+0.099840)
+    step: applied_effort=+0.049840 Nm (computed=+0.099840)
+  effort_limit respected (peak 0.150000 <= 0.15)
+
+--- md01i/m3 (bundled params file) ---
+  motor=md01i  friction model=m3 terms=['load_dependent']
+    ...
+
+--- md01c (loop law, module defaults) ---
+  motor=md01c  friction model=None terms=[]
+    ...
 
 --- sts3215/m5 (bundled params file) ---
   motor=sts3215  friction model=m5 terms=['load_dependent', 'directional', 'stribeck']
-    ...
+    step: applied_effort=+0.150000 Nm (computed=+0.537778)
+    step: applied_effort=+0.150000 Nm (computed=+1.075557)
+    step: applied_effort=+0.150000 Nm (computed=+1.613335)
+  effort_limit respected (peak 0.150000 <= 0.15)
 
 OK: BamActuator works inside Isaac Lab.
 ```
 
-*(the effort numbers are illustrative; the labels and the model/terms values are real)*
+*(the `...` rows print theirs too; the numbers above come from the model, not a simulator)*
 
 Reading it:
 
 - **`friction model=… terms=…`** — which variant the params file selected. `None` with
   empty `terms` means no params file, so only the base variant applies.
 - **the three `step:` lines** — `compute()` handed back finite efforts of the right shape.
-  Three steps rather than one, so a stateful control law (the STS3215's slew-limited
-  internal target) actually exercises its limiter.
-- **`effort_limit respected`** — a deliberately huge command is still clipped.
+  `md01` is stateless, so its three `computed` values are identical, while the STS3215's
+  climb (0.54 → 1.08 → 1.61 Nm) as its slew-limited internal target travels towards the
+  command. That growth is exactly why there are three steps rather than one.
+- **`effort_limit respected`** — a deliberately huge command is still clipped. The
+  limit is deliberately low (0.15 Nm) so the clip actually binds in every case.
 
-### Why those two cases
+### Why those cases
 
-1. **`md01` with `motor_params`** — MD01 has no bundled params, and BAM seeds its `kt` at
-   `0.0`, so it produces no torque until someone supplies one. This case proves the
-   `motor_params` escape hatch works.
-2. **`sts3215/m5`** — a bundled identified model. The params file alone decides *both*
-   the motor and the friction maths; `--motor` is not involved.
+1. **`md01`** — the voltage law with no params file: the module's own seeds are the
+   model, the way BAM's `MD01Actuator.initialize()` seeds it. (No `md01` fits are
+   bundled; the campaign-2 fits are the `md01i` ones below.)
+2. **`md01i/m3`** — a bundled identified model of the *new* campaign. The params file
+   alone decides the motor (`"actuator": "md01i"`), the friction maths (`"model":
+   "m3"`) and every identified value, including the current limit that no cfg field
+   carries.
+3. **`md01c`** — the measured AT32 loops, whose firmware constants (`kp_current`,
+   `kff_current`, `cap_ma`) are module defaults rather than params-file values.
+4. **`sts3215/m5`** — a stateful control law, so stepping the same instance three
+   times is what exercises the slew limiter.
 
 ### What a failure means
 
@@ -147,6 +170,10 @@ python scripts/pendulum_scene.py --command nothing --initial-angle 1.2 --visual
 
 # Lift to -pi/2, then release the motor at 2 s and let it fall
 python scripts/pendulum_scene.py --command lift_and_drop --visual --speed 0.5
+
+# The new MD01 campaign: the current law, on a real MD01 recording
+BAM_ROOT=/path/to/BAM python scripts/pendulum_scene.py --motor md01i --params md01i/m3 \
+    --log $BAM_ROOT/data_md01-6v2/2026-09-21_18h22m26.json
 
 # Headless, no BAM checkout required, write the curves out
 python scripts/pendulum_scene.py --log none --command steps --csv /tmp/traj.csv
@@ -334,7 +361,8 @@ That is a couple of centimetres at the tip. Read a subtle difference as data, no
 4. Watch the winner: `--visual --overlay` on the top two.
 
 Note the whole `--model1`/`--model2`/`--models` family ignores `--params`, and each
-model is resolved against `--motor`, so `--model1 m3` means `<motor>/m3.json`.
+model is resolved against `--motor`, so `--model1 m3` means `<motor>/m3.json`. For the
+MD01 campaign, add `--motor md01i` so the variants resolve to `md01i/*.json`:
 
 ### "I added a motor and want to check it"
 
@@ -362,6 +390,7 @@ Two comparisons, two different diagnoses:
 | `ModuleNotFoundError: bam` | Only needed for `--log`. Either set `BAM_ROOT`, or pass `--log none`. |
 | `no recording at …` then `falling back to a synthetic run` | `BAM_ROOT` is unset or points elsewhere. Harmless; pass `--log none` to silence it. |
 | `FileNotFoundError: No bundled params for …` | The model name is not bundled. `available_bundled()` in the traceback lists what is; `--list-motors` lists motors. |
+| `No bundled params for 'md01/m3'` but the JSON exists | The directory is named after the **actuator**, not the product. The campaign-2 MD01 fits were identified with the current law, so they are `md01i/m3`, not `md01/m3`. |
 | `TypeError: can't assign a BamFrictionModel to a torch…FloatTensor` | An attribute on `BamActuator` is shadowing one of `ActuatorBase`'s (`friction`, `armature`, `stiffness`, …). Ours is called `friction_model` for exactly this reason. |
 | `PDGainsCfg.stiffness is MISSING` | The URDF spawner needs explicit drive gains. The scene passes `stiffness=0.0, damping=0.0`. |
 | The window opens and closes instantly | You are on a `main()` that returned before entering the render loop. Use `--loop`, or drop `--visual` and read the report. |

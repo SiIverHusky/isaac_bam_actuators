@@ -23,13 +23,14 @@ isaac_bam_actuators/
 │   ├── testbench.py            # the URDF realising BAM's pendulum testbench
 │   ├── params.py               # locates the bundled identified models
 │   ├── params/                 # identified models, shipped with the extension
-│   │   └── sts3215/m1..m6.json
+│   │   ├── sts3215/m1..m6.json
+│   │   └── md01i/m1..m6.json   # the MD01 campaign-2 fits (current law)
 │   ├── motors/                 # ONE MODULE PER SERVO: the control laws
 │   │   ├── __init__.py         # auto-discovers the modules below
 │   │   ├── base.py             # MotorBase: DC torque + helpers + state hooks
 │   │   ├── generic.py          # plain voltage-P servo (fallback)
 │   │   ├── feetech_sts3215.py  # STS3215: slew-limited target + gain ratio
-│   │   └── md01.py             # MD01: P law + firmware current limit
+│   │   └── md01.py             # MD01: md01 (volts), md01i and md01c (amps)
 │   └── actuators/
 │       ├── __init__.py
 │       └── bam_actuator.py     # BamActuator: motor + friction -> joint effort
@@ -39,6 +40,7 @@ isaac_bam_actuators/
 └── tests/
     ├── test_friction.py        # the m1–m6 maths
     ├── test_motors.py          # each control law vs BAM's actuator class
+    ├── test_md01i_model.py     # the bundled MD01 campaign fits, end to end
     ├── test_trajectory.py      # the trajectory port vs bam.trajectory
     ├── test_testbench.py       # the rig geometry vs bam.testbench.Pendulum
     └── test_sts3215_m5.py      # real identified models, end to end
@@ -69,6 +71,13 @@ class MyServoMotor(MotorBase):
 `self._duty_from_error`, `self._apply_current_limit` and `self._volts` are the
 shared firmware building blocks; override `control` to do something else (as the
 STS3215 does with its slew limiter), and set `stateful = True` if you keep state.
+
+A **current**-controlled servo (the AT32-driven MD01) declares
+``control_unit = "amps"`` instead: then the control signal *is* the current and
+:meth:`MotorBase.torque` switches to ``tau = kt * I``, because the inner loop
+already accounts for the back-EMF. ``_current_from_duty`` is the shared helper for
+feeding that setpoint through the H-bridge. See ``motors/md01.py`` for all three MD01
+laws.
 
 
 ## How an Isaac Lab extension works
@@ -110,7 +119,12 @@ python -m pip install -e /path/to/isaac_bam_actuators
 #    before you debug anything about the scene.
 python -m pip install pytest
 BAM_ROOT=/path/to/BAM python -m pytest tests/ -q
-# -> 102 passed. Without BAM_ROOT, 76 pass and the 26 parity tests skip.
+# -> 135 passed, 4 skipped. Without a BAM checkout: 92 passed, 47 skipped.
+#
+#    The 4 skips are the STS3215 rollout cases: their Feetech recording
+#    (data_raw/2026-09-10_15h22m23.json) is no longer in BAM's checkout, and the
+#    recordings that are predate the `arm_mass` the Pendulum testbench needs. Drop
+#    that file back in and they run. The MD01 cases replay data_md01-6v2 instead.
 
 # 3. Check the Isaac Lab integration without building a scene.
 python scripts/check_isaac_actuator.py
@@ -124,6 +138,7 @@ python scripts/pendulum_scene.py --visual --models m1 m3 m6  # any number
 python scripts/pendulum_scene.py --visual --models m1 m6 --overlay  # same pivot
 python scripts/pendulum_scene.py --visual --command lift_and_drop --speed 0.25
 python scripts/pendulum_scene.py --command nothing --initial-angle 1.2 --visual
+python scripts/pendulum_scene.py --motor md01i --params md01i/m3   # the MD01 campaign
 python scripts/pendulum_scene.py --list-motors                # valid --motor values
 python scripts/pendulum_scene.py --csv /tmp/traj.csv
 ```
@@ -180,9 +195,10 @@ When a recording *is* replayed, two comparisons are reported:
 - **Isaac vs the recording** — the model against the physical servo. This is the
   one that answers "does it react like it's supposed to".
 
-`--motor` takes the name BAM's params files write (`sts3215`, `md01`), not the
-module filename; `--list-motors` prints the valid values. The params file's
-`"actuator"` key overrides it, so `--params sts3215/m5` alone is enough.
+`--motor` takes the name BAM's params files write (`sts3215`, `md01`, `md01i`,
+`md01c`), not the module filename; `--list-motors` prints the valid values. The
+params file's `"actuator"` key overrides it, so `--params sts3215/m5` alone is
+enough.
 
 The script also shows the external-torque hook in action: it computes
 `(mass + arm_mass/2) * g * L * sin(q)` each step and pushes it in via
@@ -339,6 +355,36 @@ BamActuatorCfg(
 )
 ```
 
+### The MD01 family
+
+BAM models the Mangdang MD01 three ways, and all three are ported. Which one a params
+file describes is in its `"actuator"` key, so the file alone picks the law:
+
+| name | control law | unit |
+| --- | --- | --- |
+| `md01` | voltage P law, with the firmware current limit as a duty-cycle window | volts |
+| `md01i` | current setpoint `kp * error_gain * ratio * error`, capped at `current_limit` | amps |
+| `md01c` | the measured AT32 position and current loops, against the stall plant `I = (duty*vin - V0)/R` | amps |
+
+The campaign-2 fits — servo 6 of the bench module, `data_md01-6v2`, 175 logs — are
+bundled as **`md01i/m1..m6`**, and `m3` is the working model (22–30 mrad position MAE
+on the held-out gains, against ~50 mrad for the voltage law on the same data):
+
+```python
+BamActuatorCfg(..., params_file="md01i/m3", physics_dt=1.0 / 200.0)
+```
+
+Two things worth knowing before you fit or tune one:
+
+* **`kt` is a gauge in the `md01i` law.** Rescaling it together with
+  `error_gain_ratio` and `current_limit` leaves the position error unchanged; the
+  physical quantity is the torque ceiling `kt * current_limit` (0.43–0.46 Nm for
+  m1/m3/m5/m6). `MD01CurrentMotor.torque_limit` exposes it.
+* **`md01c`'s loop gains come from the AT32 flash, not the file** (`kp_current`,
+  `kff_current`, `max_pwm`, `cap_ma`), so pass them through `motor_params` when they
+  differ from the module defaults — `scripts/pendulum_scene.py` reads them off the
+  recording.
+
 ### Loading BAM params
 
 A BAM params file is self-describing, so loading one is all you need:
@@ -356,7 +402,8 @@ BamActuatorCfg(
 | `actuator` (`"sts3215"`) | **which control law runs** (from `bam_actuators/motors/`) |
 | `model` (`"m5"`) | which friction terms are evaluated |
 | `kt`, `R`, `armature`, `q_offset` | the motor model |
-| `error_gain_ratio`, `max_velocity`, `command_delay` | the motor model, if that motor uses them |
+| `error_gain_ratio`, `current_limit`, `V0`, `kp_ratio` | the motor model, when that law uses them (`md01i`/`md01c`) |
+| `max_velocity`, `command_delay` | the motor model, if that motor uses them |
 | `friction_*`, `load_friction_*`, `dtheta_stribeck`, `alpha` | the friction model |
 
 `kt`, `R`, `armature` and `q_offset` are the only parameters a *friction* model needs
@@ -365,9 +412,10 @@ but that belong to the motor, so the actuator routes them to the motor module.
 Firmware constants are **not** in params files at all — they live on the motor module.
 BAM's ``load_log`` decides which of them a *recording* supplies, and that differs per
 motor: ``DCMotorActuator.load_log`` sets ``kp`` and ``vin``; ``MD01Actuator`` also takes
-``error_gain`` and ``max_pwm``; ``STS3215Actuator`` overrides nothing, so its
-``error_gain`` stays at the class default 0.166 whatever the log says. Read them off
-BAM's actuator rather than assuming.
+``error_gain`` and ``max_pwm``; ``MD01LoopActuator`` also takes the AT32 loop gains
+(``kp_current``, ``kff_current``, ``max_pwm``, ``cap_ma``); ``STS3215Actuator`` overrides
+nothing, so its ``error_gain`` stays at the class default 0.166 whatever the log says.
+Read them off BAM's actuator rather than assuming.
 
 If you have no file, pick the friction variant directly:
 
@@ -387,8 +435,9 @@ Per environment and joint, every step:
 
 ```
 q_physics    = joint_pos + q_offset                                        # rig offset: physics only
-volts        = motor.control(q_target, joint_pos, dq, dt)                   # per-motor firmware
-motor_torque = kt * volts / R - kt^2 * dq / R                               # DC motor + back-EMF
+control      = motor.control(q_target, joint_pos, dq, dt)                  # per-motor firmware
+motor_torque = kt * control / R - kt^2 * dq / R     # voltage law ("volts")
+             = kt * control                         # current law ("amps")
 net_torque   = motor_torque + external_torque
 tau_stop     = net_torque + (inertia / dt) * dq                             # torque to stop in dt
 tau_friction = -sign(tau_stop) * min(|tau_stop|, frictionloss + damping*|dq|)
@@ -401,7 +450,8 @@ meaningful under that convention.
 
 The control law is `Motor.control` from the selected module (see
 `bam_actuators/motors/`); the DC motor torque is shared by every voltage-controlled
-servo; `frictionloss` / `damping` come from
+servo, while a current-controlled one turns its command into torque directly;
+`frictionloss` / `damping` come from
 `bam_actuators.friction.BamFrictionModel`, a vectorized torch port of
 `bam.model.Model.compute_frictions`. The stopping-torque clip is BAM's Algorithm 1,
 which is what produces realistic stiction: a joint at rest does not drift under a
